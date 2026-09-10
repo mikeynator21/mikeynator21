@@ -47,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Getting started:\n"
             "  wifiguard init-config > /etc/wifiguard/wifiguard.toml\n"
             "  wifiguard doctor            # check this machine is ready\n"
+            "  wifiguard fieldtest         # what is this network doing to my DNS?\n"
             "  sudo wifiguard run          # start filtering\n"
             "  wifiguard selftest          # prove it works, no root needed\n"
         ),
@@ -69,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="show the running service's status")
     sub.add_parser("doctor", help="check this machine can run the gateway")
     sub.add_parser("init-config", help="print a commented example configuration")
+
+    fieldtest = sub.add_parser(
+        "fieldtest",
+        help="assess the network this machine is on, and what WiFiGuard would change",
+    )
+    fieldtest.add_argument("--quick", action="store_true", help="skip the slower probes")
 
     selftest = sub.add_parser("selftest", help="run the full stack locally and verify it")
     selftest.add_argument("--port", type=int, default=15353, help="port to test on")
@@ -341,6 +348,38 @@ def command_doctor(args: argparse.Namespace, cfg: Config) -> int:
         print(f"{failures} check(s) failed. WiFiGuard may still start, but fix these first.")
         return 1
     print("Everything checks out.")
+    return 0
+
+
+def command_fieldtest(args: argparse.Namespace, cfg: Config) -> int:
+    """Report on the network this machine is actually attached to."""
+    from . import fieldtest
+
+    print("Assessing this network. Nothing is modified.\n")
+    report = fieldtest.run(quick=args.quick)
+    print(report.render(), end="")
+
+    problems = report.by_severity("problem")
+    warnings = report.by_severity("warn")
+
+    if problems:
+        print(f"  {len(problems)} problem(s) found on this network:")
+        for finding in problems:
+            print(f"    - {finding.title}")
+        print()
+        print("  These are things the network is doing to your traffic, not faults")
+        print("  in this machine. Each one above says what WiFiGuard does about it.")
+        return 1
+
+    if warnings:
+        print(f"  Nothing seriously wrong. {len(warnings)} thing(s) worth knowing:")
+        for finding in warnings:
+            print(f"    - {finding.title}")
+        return 0
+
+    print("  This network looks clean: no interception, no rewriting, and")
+    print("  encrypted DNS gets out. WiFiGuard will filter ads and trackers here")
+    print("  without having to work around anything.")
     return 0
 
 
@@ -881,6 +920,7 @@ COMMANDS = {
     "status": command_status,
     "doctor": command_doctor,
     "selftest": command_selftest,
+    "fieldtest": command_fieldtest,
     "allow": command_allow,
     "block": command_block,
     "blocklist": command_blocklist,

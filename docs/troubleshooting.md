@@ -5,8 +5,14 @@ Start here:
 ```bash
 wifiguard doctor      # is the machine set up correctly?
 wifiguard selftest    # does the filtering work? (no root, no internet needed)
+wifiguard fieldtest   # what is this network doing to my DNS?
 wifiguard status      # what is the running service doing?
 ```
+
+`doctor` and `selftest` look inward: is this machine configured properly, and
+does the software work. `fieldtest` looks outward at the network you are on --
+which is where the answer usually is when everything checks out locally and
+things still misbehave.
 
 `selftest` exercises the real resolver, cache, firewall generator, DHCP server
 and VPN config generator against a stub upstream on loopback. If it passes, the
@@ -73,6 +79,38 @@ which is usually faster than the command line.
 
 If `check` says `allow` and the site is still broken, WiFiGuard is not the
 cause.
+
+## The network itself is interfering
+
+Some networks intercept DNS, rewrite answers, or re-sign TLS. On those,
+everything about WiFiGuard can be correct and results still look wrong.
+
+```bash
+wifiguard fieldtest
+```
+
+**"This network intercepts DNS"** — port 53 is being answered by the network
+regardless of the resolver you addressed. Encrypted upstream is the answer, and
+`fieldtest` will also tell you whether DoH can get out from here.
+
+**"DNS answers are being rewritten"** — you are not getting what the
+authoritative servers published. Same fix.
+
+**"TLS is being intercepted"** — a middlebox is re-signing HTTPS with a CA your
+machine trusts, so certificate verification passes and nothing notices. Pin the
+resolver's real key, captured from a network you trust:
+
+```bash
+wifiguard tls pin dns.quad9.net      # on a network you trust
+```
+
+Then WiFiGuard refuses to resolve through the interception instead of talking
+through it.
+
+**"DNS-over-HTTPS cannot get out"** — the network blocks or terminates
+encrypted DNS. You can fall back with `upstream.require_encrypted = false`, but
+on a network that both intercepts plain DNS *and* blocks the encrypted
+alternative, understand that every lookup is visible to whoever runs it.
 
 ## Devices bypassing the filter
 

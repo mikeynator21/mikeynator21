@@ -66,6 +66,7 @@ Then check the machine is ready and prove the filtering works:
 ```bash
 wifiguard doctor      # is this machine set up correctly?
 wifiguard selftest    # does the filtering actually work? (no root needed)
+wifiguard fieldtest   # what is this network doing to my DNS right now?
 ```
 
 `selftest` runs the real resolver, the real cache and the real firewall
@@ -77,6 +78,35 @@ Docker, if you prefer:
 ```bash
 cd deploy && docker compose up -d
 ```
+
+## What is your network doing right now?
+
+Before installing anything, `wifiguard fieldtest` assesses the network this
+machine is attached to. It needs no root and changes nothing.
+
+```console
+$ wifiguard fieldtest
+  [FAIL] This network intercepts DNS
+           A query addressed to 203.0.113.99 was answered. That address is in a
+           reserved documentation range where no resolver can exist, so
+           something on the path is answering port 53 on its behalf.
+        -> WiFiGuard sends its queries over DNS-over-HTTPS on port 443 instead,
+        -> which this cannot read or rewrite.
+
+  [FAIL] TLS on this network is being intercepted
+           The certificate for dns.quad9.net was issued by "Acme Middlebox",
+           which is not a public certificate authority. Certificate
+           verification still passes, because that CA is trusted by this
+           machine -- so nothing else would notice.
+        -> Pin the resolver's real key so WiFiGuard refuses to resolve rather
+        -> than talking through the interception.
+```
+
+It checks whether port 53 is intercepted, whether answers are being rewritten,
+whether failed lookups are redirected to an ads page, whether encrypted DNS can
+get out, whether TLS is being re-signed on the way, whether a captive portal is
+in the way, and whether an unfiltered IPv6 path exists to leak around the
+filtering. Each finding says what WiFiGuard does about it.
 
 ## Point your devices at it
 
@@ -252,7 +282,7 @@ Worked examples are in [deploy/examples/](deploy/examples/).
 Three layers, each proving something the one below it cannot.
 
 ```bash
-python3 -m unittest discover -s tests -v      # 288 unit tests, no network needed
+python3 -m unittest discover -s tests -v      # 304 unit tests, no network needed
 wifiguard selftest                            # 55 checks, the real stack on loopback
 sudo ./tests/integration/run.sh               # 66 checks on a virtual network
 ```
