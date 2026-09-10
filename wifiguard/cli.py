@@ -249,7 +249,7 @@ def command_status(args: argparse.Namespace, cfg: Config) -> int:
             file=sys.stderr,
         )
         return 1
-    except ApiError as exc:
+    except (ApiError, Ambiguous) as exc:
         print(f"WiFiGuard is running, but {exc}", file=sys.stderr)
         return 1
 
@@ -440,6 +440,17 @@ def _local_rule(cfg: Config, domain: str, *, allow: bool) -> int:
         print(f"WiFiGuard is running, but {exc}", file=sys.stderr)
         print(f"\n{domain} was NOT changed.", file=sys.stderr)
         return 1
+    except Ambiguous as exc:
+        # The request went out and the answer did not come back. It may well
+        # have been applied, so writing it again locally and announcing "not
+        # running" would be a guess dressed up as a fact.
+        print(f"Lost contact with WiFiGuard partway through ({exc}).", file=sys.stderr)
+        print(
+            f"\n{domain} may or may not have been changed. Check with:\n"
+            f"  wifiguard check {domain}",
+            file=sys.stderr,
+        )
+        return 2
     except NotRunning:
         pass
 
@@ -709,7 +720,7 @@ def _compat_scan(cfg: Config, guard, limit: int) -> int:
         print(f"WiFiGuard does not appear to be running ({exc}).", file=sys.stderr)
         print("The scan reads the live query log, so start it first.", file=sys.stderr)
         return 1
-    except ApiError as exc:
+    except (ApiError, Ambiguous) as exc:
         print(f"WiFiGuard is running, but {exc}", file=sys.stderr)
         return 1
 
@@ -781,7 +792,7 @@ def command_cluster(args: argparse.Namespace, cfg: Config) -> int:
     # Prefer the running service, which knows about live peers.
     try:
         status = _api(cfg, "/api/status").get("cluster")
-    except (NotRunning, ApiError):
+    except (NotRunning, ApiError, Ambiguous):
         status = None
 
     if status is None:
@@ -1014,7 +1025,25 @@ class NotRunning(Exception):
 
 
 class ApiError(Exception):
-    """It is listening, but the call did not succeed."""
+    """It is listening, but the call was refused."""
+
+
+class Ambiguous(Exception):
+    """The call may or may not have been applied.
+
+    A timeout or a dropped connection after the request was sent leaves no way
+    to know whether the daemon acted on it, and guessing either way is worse
+    than saying so.
+    """
+
+
+import errno as _errno
+
+#: Errors that mean nothing is listening, as opposed to something going wrong
+#: partway through a request.
+_NOT_LISTENING = frozenset({
+    _errno.ECONNREFUSED, _errno.ENOENT, _errno.EHOSTUNREACH, _errno.ENETUNREACH,
+})
 
 
 def _api(cfg: Config, path: str, payload: dict | None = None, timeout: float = 5.0):
@@ -1040,14 +1069,15 @@ def _api(cfg: Config, path: str, payload: dict | None = None, timeout: float = 5
             body = response.read()
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403, 429):
-            detail = ""
-            try:
-                detail = json.loads(exc.read()).get("error", "")
-            except Exception:  # noqa: BLE001
-                pass
+        detail = ""
+        try:
+            detail = json.loads(exc.read()).get("error", "")
+        except Exception:  # noqa: BLE001 - the body is a courtesy, not a contract
+            pass
+
+        if exc.code in (401, 429):
             hint = (
-                f"the daemon refused this ({detail or exc.reason})."
+                f"the daemon refused these credentials ({detail or exc.reason})."
                 if token
                 else "a dashboard password is set and this command could not find "
                      f"the local admin token in {cfg.state_dir}."
@@ -1058,9 +1088,26 @@ def _api(cfg: Config, path: str, payload: dict | None = None, timeout: float = 5
                 f"only by the user it runs as -- so run this as that user, "
                 f"usually with sudo."
             ) from exc
-        raise ApiError(f"HTTP {exc.code}: {exc.reason}") from exc
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise NotRunning(str(exc)) from exc
+
+        # 403 is not about credentials: read-only mode returns it before they
+        # are even looked at. Reporting it as an auth problem sends people
+        # hunting for a token that is not the issue.
+        raise ApiError(detail or f"HTTP {exc.code}: {exc.reason}") from exc
+
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        # Only a refused or unreachable endpoint means "not running". A read
+        # timeout is ambiguous -- the request may already have been applied --
+        # and must not be reported as though nothing happened.
+        if isinstance(reason, (ConnectionRefusedError, FileNotFoundError)) or (
+            isinstance(reason, OSError) and reason.errno in _NOT_LISTENING
+        ):
+            raise NotRunning(str(reason)) from exc
+        raise Ambiguous(str(reason)) from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise Ambiguous(f"timed out after {timeout:.0f}s") from exc
+    except (OSError, ValueError) as exc:
+        raise Ambiguous(str(exc)) from exc
 
 
 def _dashboard_host(cfg: Config) -> str:

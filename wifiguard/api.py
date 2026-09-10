@@ -53,7 +53,8 @@ class Dashboard:
 
     def start(self) -> None:
         if self.config.password:
-            self._token.load_or_create()
+            # Bound to the password, so changing the password revokes the token.
+            self._token.load_or_create(self.config.password)
         handler = _make_handler(self)
         try:
             self._server = ThreadingHTTPServer((self.config.address, self.config.port), handler)

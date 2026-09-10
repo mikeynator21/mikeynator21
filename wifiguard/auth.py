@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import secrets
 import threading
 import time
+
+log = logging.getLogger(__name__)
 
 #: scrypt parameters. n=16384 costs roughly 16MB and a few tens of
 #: milliseconds, which is nothing per login and a great deal per guess.
@@ -55,7 +58,9 @@ def verify_password(supplied: str, stored: str) -> bool:
         return False
 
     if not is_hashed(stored):
-        return hmac.compare_digest(supplied, stored)
+        # Encoded first: compare_digest refuses non-ASCII str outright, so
+        # comparing them directly would raise rather than return False.
+        return hmac.compare_digest(supplied.encode("utf-8"), stored.encode("utf-8"))
 
     try:
         _, salt_hex, expected_hex = stored.split("$", 2)
@@ -155,15 +160,28 @@ class AdminToken:
         #: grant access -- it only breaks the CLI until the next restart.
         self._value = ""
 
-    def load_or_create(self) -> str:
-        """Read the token, creating one if this is the first start."""
+    def load_or_create(self, password: str = "") -> str:
+        """Read the token, issuing a new one if it is missing or stale.
+
+        A token is bound to the password that was configured when it was
+        issued. Changing the password is how someone revokes access, so a
+        token that outlived the password it was issued under would quietly
+        defeat that.
+        """
         import os
         import stat
 
+        wanted = self.fingerprint(password)
         existing = self.read()
-        if existing:
+        if existing and self.issued_for() == wanted:
             self._value = existing
             return existing
+
+        if existing:
+            log.info(
+                "the dashboard password changed, so the local admin token has "
+                "been reissued; any copy of the old one no longer works"
+            )
 
         token = secrets.token_urlsafe(32)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,18 +191,46 @@ class AdminToken:
             self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
             stat.S_IRUSR | stat.S_IWUSR,
         )
-        with os.fdopen(handle, "w", encoding="ascii") as file:
-            file.write(token)
+        with os.fdopen(handle, "w", encoding="utf-8") as file:
+            file.write(f"{token}\n{wanted}")
         os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
         self._value = token
         return token
 
     def read(self) -> str:
+        """The stored token, or "" if there is not a usable one.
+
+        Anything unreadable -- missing, truncated, not text -- reads as absent
+        so that `load_or_create` replaces it. Raising here would take the
+        daemon down at start-up over a corrupt file it can simply rewrite.
+        """
         try:
-            token = self.path.read_text(encoding="ascii").strip()
-        except OSError:
+            payload = self.path.read_text(encoding="utf-8").strip()
+        except (OSError, ValueError, UnicodeDecodeError):
             return ""
+
+        token, _, _ = payload.partition("\n")
+        token = token.strip()
         return token if len(token) >= 20 else ""
+
+    def issued_for(self) -> str:
+        """The password fingerprint this token was issued against."""
+        try:
+            payload = self.path.read_text(encoding="utf-8")
+        except (OSError, ValueError, UnicodeDecodeError):
+            return ""
+        _, _, fingerprint = payload.partition("\n")
+        return fingerprint.strip()
+
+    @staticmethod
+    def fingerprint(password: str) -> str:
+        """A short, non-reversible marker for "which password is configured".
+
+        Stored beside the token so that changing the password invalidates it.
+        """
+        if not password:
+            return ""
+        return hashlib.sha256(password.encode("utf-8")).hexdigest()[:32]
 
     def matches(self, supplied: str) -> bool:
         """Compare against the token held in memory since start-up.
@@ -193,7 +239,12 @@ class AdminToken:
         could choose the secret, and "can write this file" is a weaker
         condition than "was here when the service started".
         """
-        return bool(self._value) and hmac.compare_digest(supplied, self._value)
+        if not self._value:
+            return False
+        # Encoded for the same reason as above: this runs before the password
+        # check, so a non-ASCII password would otherwise raise here and never
+        # reach the code that can verify it.
+        return hmac.compare_digest(supplied.encode("utf-8"), self._value.encode("utf-8"))
 
 
 def looks_local(address: str) -> bool:

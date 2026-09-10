@@ -46,6 +46,24 @@ class PasswordTests(unittest.TestCase):
     def test_corrupt_hash_does_not_crash(self):
         self.assertFalse(verify_password("x", "scrypt$notahex$alsonot"))
 
+    def test_non_ascii_password_hashed(self):
+        stored = hash_password("pässwörd-123")
+        self.assertTrue(verify_password("pässwörd-123", stored))
+        self.assertFalse(verify_password("passwoerd-123", stored))
+
+    def test_non_ascii_password_plaintext_does_not_raise(self):
+        """compare_digest refuses non-ASCII str outright.
+
+        Comparing them directly raised TypeError, which surfaced as HTTP 500 --
+        so a correct password locked you out of your own dashboard.
+        """
+        self.assertTrue(verify_password("pässwörd", "pässwörd"))
+        self.assertFalse(verify_password("wrong", "pässwörd"))
+
+    def test_emoji_password(self):
+        stored = hash_password("correct-horse-\U0001F410")
+        self.assertTrue(verify_password("correct-horse-\U0001F410", stored))
+
 
 class AttemptLimiterTests(unittest.TestCase):
     def test_failures_below_the_limit_do_not_lock(self):
@@ -146,6 +164,37 @@ class AdminTokenTests(unittest.TestCase):
 
     def test_a_missing_file_reads_empty(self):
         self.assertEqual(self._token().read(), "")
+
+    def test_a_corrupt_file_is_replaced_rather_than_crashing(self):
+        """A daemon must not fail to start over a file it can simply rewrite."""
+        token = self._token()
+        token.path.parent.mkdir(parents=True, exist_ok=True)
+        token.path.write_bytes(b"\xff\xfe not valid text at all")
+        replacement = token.load_or_create("a-password")
+        self.assertGreaterEqual(len(replacement), 20)
+        self.assertTrue(token.matches(replacement))
+
+    def test_reissued_when_the_password_changes(self):
+        """Changing the password is how access is revoked, so a token that
+        outlived it would quietly defeat that."""
+        first = self._token().load_or_create("first-password")
+        second = self._token().load_or_create("second-password")
+        self.assertNotEqual(first, second)
+
+    def test_kept_while_the_password_is_unchanged(self):
+        first = self._token().load_or_create("same-password")
+        self.assertEqual(self._token().load_or_create("same-password"), first)
+
+    def test_the_password_is_not_recoverable_from_the_file(self):
+        token = self._token()
+        token.load_or_create("swordfish")
+        self.assertNotIn("swordfish", token.path.read_text())
+
+    def test_a_non_ascii_token_comparison_does_not_raise(self):
+        # compare_digest refuses non-ASCII str, so this has to encode first.
+        token = self._token()
+        token.load_or_create("x")
+        self.assertFalse(token.matches("tökén-with-accents"))
 
 
 class ExposureTests(unittest.TestCase):
