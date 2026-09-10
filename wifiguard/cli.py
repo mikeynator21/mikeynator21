@@ -240,19 +240,17 @@ def command_check(args: argparse.Namespace, cfg: Config) -> int:
 
 
 def command_status(args: argparse.Namespace, cfg: Config) -> int:
-    url = f"http://{_dashboard_host(cfg)}:{cfg.dashboard.port}/api/status"
     try:
-        request = urllib.request.Request(url)
-        if cfg.dashboard.password:
-            import base64
-
-            token = base64.b64encode(f"wifiguard:{cfg.dashboard.password}".encode()).decode()
-            request.add_header("Authorization", f"Basic {token}")
-        with urllib.request.urlopen(request, timeout=5) as response:
-            status = json.loads(response.read())
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+        status = _api(cfg, "/api/status")
+    except NotRunning as exc:
         print(f"WiFiGuard does not appear to be running ({exc}).", file=sys.stderr)
-        print(f"Tried {url}", file=sys.stderr)
+        print(
+            f"Tried http://{_dashboard_host(cfg)}:{cfg.dashboard.port}/api/status",
+            file=sys.stderr,
+        )
+        return 1
+    except ApiError as exc:
+        print(f"WiFiGuard is running, but {exc}", file=sys.stderr)
         return 1
 
     counters = status["counters"]
@@ -427,30 +425,29 @@ def command_block(args: argparse.Namespace, cfg: Config) -> int:
 
 
 def _local_rule(cfg: Config, domain: str, *, allow: bool) -> int:
-    # Prefer the running service so the change takes effect immediately.
-    url = f"http://{_dashboard_host(cfg)}:{cfg.dashboard.port}/api/{'allow' if allow else 'block'}"
-    payload = json.dumps({"domain": domain}).encode()
-    request = urllib.request.Request(
-        url, data=payload, headers={"Content-Type": "application/json"}
-    )
-    if cfg.dashboard.password:
-        import base64
+    verb = "Allowed" if allow else "Blocked"
+    endpoint = "/api/allow" if allow else "/api/block"
 
-        token = base64.b64encode(f"wifiguard:{cfg.dashboard.password}".encode()).decode()
-        request.add_header("Authorization", f"Basic {token}")
-
+    # Prefer the running service, so the change takes effect at once.
     try:
-        with urllib.request.urlopen(request, timeout=5):
-            print(f"{'Allowed' if allow else 'Blocked'} {domain} (applied immediately).")
-            return 0
-    except (urllib.error.URLError, OSError):
+        _api(cfg, endpoint, {"domain": domain})
+        print(f"{verb} {domain} (applied immediately).")
+        return 0
+    except ApiError as exc:
+        # It is running and refused us. Writing the rule to disk anyway would
+        # leave the daemon still filtering the name while telling the caller it
+        # had been allowed, which is worse than failing.
+        print(f"WiFiGuard is running, but {exc}", file=sys.stderr)
+        print(f"\n{domain} was NOT changed.", file=sys.stderr)
+        return 1
+    except NotRunning:
         pass
 
     application = Application(cfg)
     application.add_local_rule(domain, allow=allow)
     print(
-        f"{'Allowed' if allow else 'Blocked'} {domain}. "
-        f"WiFiGuard is not running, so this takes effect at the next start."
+        f"{verb} {domain}. WiFiGuard is not running, so this takes effect when "
+        f"it next starts."
     )
     return 0
 
@@ -706,13 +703,14 @@ def command_compat(args: argparse.Namespace, cfg: Config) -> int:
 
 def _compat_scan(cfg: Config, guard, limit: int) -> int:
     """Look through recent blocks for things that look like they break a device."""
-    url = f"http://{_dashboard_host(cfg)}:{cfg.dashboard.port}/api/queries?limit={limit}&action=block"
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
-            queries = json.loads(response.read()).get("queries", [])
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+        queries = _api(cfg, f"/api/queries?limit={limit}&action=block").get("queries", [])
+    except NotRunning as exc:
         print(f"WiFiGuard does not appear to be running ({exc}).", file=sys.stderr)
         print("The scan reads the live query log, so start it first.", file=sys.stderr)
+        return 1
+    except ApiError as exc:
+        print(f"WiFiGuard is running, but {exc}", file=sys.stderr)
         return 1
 
     # Words that show up in the names of services devices depend on. This is a
@@ -781,11 +779,9 @@ def command_cluster(args: argparse.Namespace, cfg: Config) -> int:
         return 0
 
     # Prefer the running service, which knows about live peers.
-    url = f"http://{_dashboard_host(cfg)}:{cfg.dashboard.port}/api/status"
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
-            status = json.loads(response.read()).get("cluster")
-    except (urllib.error.URLError, OSError, ValueError):
+        status = _api(cfg, "/api/status").get("cluster")
+    except (NotRunning, ApiError):
         status = None
 
     if status is None:
@@ -1011,6 +1007,60 @@ def command_init_config(args: argparse.Namespace, cfg: Config) -> int:
 
 
 # -- helpers ------------------------------------------------------------------
+
+
+class NotRunning(Exception):
+    """The daemon is not listening."""
+
+
+class ApiError(Exception):
+    """It is listening, but the call did not succeed."""
+
+
+def _api(cfg: Config, path: str, payload: dict | None = None, timeout: float = 5.0):
+    """Call the running daemon's API, authenticating as the local admin.
+
+    Distinguishes "not running" from "running but refused", because reporting
+    the second as the first sends people looking in the wrong place -- and, in
+    the case of `allow`, quietly did the wrong thing instead.
+    """
+    from .auth import AdminToken
+
+    url = f"http://{_dashboard_host(cfg)}:{cfg.dashboard.port}{path}"
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Content-Type": "application/json"} if data is not None else {}
+
+    token = AdminToken(cfg.state_dir).read()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    request = urllib.request.Request(url, data=data, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read()
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403, 429):
+            detail = ""
+            try:
+                detail = json.loads(exc.read()).get("error", "")
+            except Exception:  # noqa: BLE001
+                pass
+            hint = (
+                f"the daemon refused this ({detail or exc.reason})."
+                if token
+                else "a dashboard password is set and this command could not find "
+                     f"the local admin token in {cfg.state_dir}."
+            )
+            raise ApiError(
+                f"{hint}\n"
+                f"  The token is written when the service starts, and is readable "
+                f"only by the user it runs as -- so run this as that user, "
+                f"usually with sudo."
+            ) from exc
+        raise ApiError(f"HTTP {exc.code}: {exc.reason}") from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise NotRunning(str(exc)) from exc
 
 
 def _dashboard_host(cfg: Config) -> str:

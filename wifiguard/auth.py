@@ -134,6 +134,68 @@ class AttemptLimiter:
             }
 
 
+class AdminToken:
+    """A secret shared between the daemon and the CLI on the same machine.
+
+    Hashing the dashboard password is right for a human typing it, and wrong
+    for the CLI: it has only the hash, and a hash is not a password. Rather
+    than weaken the hashing or make `wifiguard status` prompt, the daemon
+    writes a token that anyone who could already read the config can read --
+    which is the same trust boundary, expressed honestly.
+    """
+
+    FILENAME = "admin.token"
+
+    def __init__(self, state_dir) -> None:
+        from pathlib import Path
+
+        self.path = Path(state_dir) / self.FILENAME
+        #: Held once the daemon has loaded it. Comparing against this rather
+        #: than re-reading the file means tampering with the file does not
+        #: grant access -- it only breaks the CLI until the next restart.
+        self._value = ""
+
+    def load_or_create(self) -> str:
+        """Read the token, creating one if this is the first start."""
+        import os
+        import stat
+
+        existing = self.read()
+        if existing:
+            self._value = existing
+            return existing
+
+        token = secrets.token_urlsafe(32)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Written before the mode is set, so create it closed rather than
+        # widening it afterwards.
+        handle = os.open(
+            self.path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        with os.fdopen(handle, "w", encoding="ascii") as file:
+            file.write(token)
+        os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
+        self._value = token
+        return token
+
+    def read(self) -> str:
+        try:
+            token = self.path.read_text(encoding="ascii").strip()
+        except OSError:
+            return ""
+        return token if len(token) >= 20 else ""
+
+    def matches(self, supplied: str) -> bool:
+        """Compare against the token held in memory since start-up.
+
+        Deliberately not a fresh read: otherwise anyone able to write the file
+        could choose the secret, and "can write this file" is a weaker
+        condition than "was here when the service started".
+        """
+        return bool(self._value) and hmac.compare_digest(supplied, self._value)
+
+
 def looks_local(address: str) -> bool:
     """Whether an address means "this machine only"."""
     return address in ("127.0.0.1", "::1", "localhost", "")

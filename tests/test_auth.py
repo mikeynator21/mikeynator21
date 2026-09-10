@@ -81,6 +81,73 @@ class AttemptLimiterTests(unittest.TestCase):
         self.assertLessEqual(len(limiter._failures), 1100)
 
 
+class AdminTokenTests(unittest.TestCase):
+    """The secret the CLI uses, since it only ever has the password's hash."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name)
+
+    def _token(self):
+        from wifiguard.auth import AdminToken
+
+        return AdminToken(self.state)
+
+    def test_created_on_first_use(self):
+        token = self._token()
+        value = token.load_or_create()
+        self.assertGreaterEqual(len(value), 20)
+        self.assertTrue(token.path.exists())
+
+    def test_reused_on_later_starts(self):
+        first = self._token().load_or_create()
+        self.assertEqual(self._token().load_or_create(), first)
+
+    def test_written_readable_only_by_its_owner(self):
+        import stat
+
+        token = self._token()
+        token.load_or_create()
+        mode = stat.S_IMODE(token.path.stat().st_mode)
+        self.assertEqual(mode, 0o600)
+
+    def test_matches_the_value_it_issued(self):
+        token = self._token()
+        value = token.load_or_create()
+        self.assertTrue(token.matches(value))
+
+    def test_rejects_anything_else(self):
+        token = self._token()
+        token.load_or_create()
+        self.assertFalse(token.matches("not-the-token"))
+        self.assertFalse(token.matches(""))
+
+    def test_tampering_with_the_file_does_not_grant_access(self):
+        """The value is held from start-up, so choosing the file's contents
+        later does not choose the secret."""
+        token = self._token()
+        token.load_or_create()
+        token.path.write_text("attacker-chosen-value-long-enough")
+        self.assertFalse(token.matches("attacker-chosen-value-long-enough"))
+
+    def test_an_unloaded_token_matches_nothing(self):
+        # A daemon that never loaded one must not accept an empty comparison.
+        self.assertFalse(self._token().matches(""))
+
+    def test_a_truncated_file_is_not_accepted(self):
+        token = self._token()
+        token.path.parent.mkdir(parents=True, exist_ok=True)
+        token.path.write_text("short")
+        self.assertEqual(token.read(), "")
+
+    def test_a_missing_file_reads_empty(self):
+        self.assertEqual(self._token().read(), "")
+
+
 class ExposureTests(unittest.TestCase):
     def test_local_addresses_recognised(self):
         for address in ("127.0.0.1", "::1", "localhost", ""):

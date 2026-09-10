@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
-from .auth import AttemptLimiter, is_hashed, looks_local, verify_password
+from .auth import AdminToken, AttemptLimiter, is_hashed, looks_local, verify_password
 from .vpn import qr
 from .vpn.wireguard import WireGuardError
 
@@ -47,8 +47,13 @@ class Dashboard:
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._limiter = AttemptLimiter()
+        # Lets the CLI on this machine authenticate without the password,
+        # which it only has the hash of.
+        self._token = AdminToken(application.config.state_dir)
 
     def start(self) -> None:
+        if self.config.password:
+            self._token.load_or_create()
         handler = _make_handler(self)
         try:
             self._server = ThreadingHTTPServer((self.config.address, self.config.port), handler)
@@ -101,6 +106,13 @@ class Dashboard:
         supplied = _extract_credential(header)
         if supplied is None:
             return False, "authentication required"
+
+        # The local admin token, used by the CLI. Checked first because it is
+        # a cheap comparison and the common case for automated callers.
+        if self._token.matches(supplied):
+            if client:
+                self._limiter.record_success(client)
+            return True, ""
 
         if verify_password(supplied, self.config.password):
             if client:
@@ -217,6 +229,13 @@ def _make_handler(dashboard: Dashboard) -> type[BaseHTTPRequestHandler]:
 
             try:
                 if not path.startswith("/api"):
+                    # The page is behind the same authentication as the API.
+                    # Without this the browser never prompts -- a 401 from
+                    # fetch() does not raise the credentials dialog, only a
+                    # top-level navigation does -- and the dashboard would
+                    # load and then sit empty for ever.
+                    if not self._authorise(write=False):
+                        return
                     self._serve_static(path)
                     return
                 if not self._authorise(write=False):
