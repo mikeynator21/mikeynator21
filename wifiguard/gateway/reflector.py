@@ -37,6 +37,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 
+from ..server import RateLimiter
+
 log = logging.getLogger(__name__)
 
 
@@ -78,6 +80,15 @@ DEDUPE_SECONDS = 2.0
 MAX_REMEMBERED = 4096
 MAX_PACKET = 9000
 
+#: Packets per second a single source may have reflected, with a burst
+#: allowance for the flurry a device sends when it joins. Reflection copies
+#: every packet onto every other network, so without a limit one device on the
+#: guest network has a multiplier into the network the guest network exists to
+#: keep it out of. Discovery is bursty but low-volume; a device that exceeds
+#: this is not looking for a printer.
+REFLECT_RATE = 50.0
+REFLECT_BURST = 200
+
 
 @dataclass
 class ReflectorStats:
@@ -85,6 +96,7 @@ class ReflectorStats:
     reflected: int = 0
     self_originated: int = 0
     duplicates: int = 0
+    rate_limited: int = 0
     errors: int = 0
     by_group: dict[str, int] = field(default_factory=dict)
 
@@ -94,6 +106,7 @@ class ReflectorStats:
             "reflected": self.reflected,
             "ignored_self": self.self_originated,
             "ignored_duplicate": self.duplicates,
+            "rate_limited": self.rate_limited,
             "errors": self.errors,
             "by_group": dict(self.by_group),
         }
@@ -119,6 +132,8 @@ class MulticastReflector:
         self._stop = threading.Event()
         self._seen: dict[bytes, float] = {}
         self._seen_lock = threading.Lock()
+        #: The same token bucket the resolver uses, per source address.
+        self._limiter = RateLimiter(REFLECT_RATE, REFLECT_BURST)
 
     @property
     def running(self) -> bool:
@@ -241,6 +256,13 @@ class MulticastReflector:
             return
 
         if not payload:
+            return
+
+        # Deduplication only stops an identical packet, and changing one byte
+        # defeats it -- so it is not a limit on volume, and something has to be.
+        if not self._limiter.allow(sender):
+            self.stats.rate_limited += 1
+            log.debug("rate-limiting %s discovery from %s", group.name, sender)
             return
 
         if self._already_seen(group, payload):

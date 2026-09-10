@@ -1,6 +1,7 @@
 """Tests for the gateway: firewall rules, DHCP, clustering and networks."""
 
 import ipaddress
+import json
 import shutil
 import socket
 import struct
@@ -840,6 +841,91 @@ class DHCPPoolTests(unittest.TestCase):
             )
         )
         self.assertEqual(len(server._pool()), 52)
+
+
+class ClusterPacketTests(unittest.TestCase):
+    """Everything here arrives before any signature has been checked."""
+
+    def setUp(self):
+        self.cluster = Cluster(
+            ClusterConfig(
+                enabled=True,
+                name="node-a",
+                secret="x" * 40,
+                peers=["10.0.0.2"],
+                address="10.0.0.1",
+            )
+        )
+
+    def test_deeply_nested_json_is_rejected_not_fatal(self):
+        # 60 kB of open brackets, inside the size cap, needing no secret.
+        # Unhandled this ends the listener thread -- and a node that stops
+        # hearing heartbeats concludes every peer is gone and promotes itself.
+        payload = (b"[" * 30000) + (b"]" * 30000)
+        self.assertLess(len(payload), 65_000)
+        self.cluster._receive(payload, "10.0.0.9")  # must not raise
+
+    def test_garbage_is_rejected(self):
+        for payload in (b"", b"not json", b"\xff\xfe", b"null", b"[]", b'{"body": 1}'):
+            with self.subTest(payload=payload):
+                self.cluster._receive(payload, "10.0.0.9")
+
+    def test_an_unsigned_message_is_rejected(self):
+        forged = json.dumps({"body": '{"type":"beat","node":"evil"}', "mac": "00"})
+        self.cluster._receive(forged.encode(), "10.0.0.9")
+        self.assertEqual(self.cluster.nodes, {})
+
+    def test_a_correctly_signed_message_is_accepted(self):
+        envelope = self.cluster._sign(
+            {"type": "beat", "node": "node-b", "address": "10.0.0.2", "priority": 40}
+        )
+        self.cluster._receive(json.dumps(envelope).encode(), "10.0.0.2")
+        self.assertIn("node-b", self.cluster.nodes)
+
+
+class ReflectorRateLimitTests(unittest.TestCase):
+    """Reflection copies a packet onto every other network.
+
+    Without a limit, one device on the guest network has a multiplier straight
+    into the network that guest network exists to keep it out of. Deduplication
+    does not help: changing a single byte defeats it.
+    """
+
+    def build(self):
+        return reflector.MulticastReflector(
+            ["wlan1", "wlan2"],
+            groups=(reflector.MDNS,),
+            own_addresses={"10.42.7.1"},
+        )
+
+    def test_a_flood_from_one_source_is_cut_off(self):
+        ref = self.build()
+        for index in range(reflector.REFLECT_BURST + 100):
+            ref._reflect(reflector.MDNS, "wlan1", f"packet-{index}".encode(), "10.42.7.50")
+        self.assertGreater(ref.stats.rate_limited, 0)
+        self.assertLessEqual(
+            ref.stats.received - ref.stats.rate_limited, reflector.REFLECT_BURST
+        )
+
+    def test_an_ordinary_discovery_burst_still_goes_through(self):
+        ref = self.build()
+        for index in range(40):
+            ref._reflect(reflector.MDNS, "wlan1", f"query-{index}".encode(), "10.42.7.50")
+        self.assertEqual(ref.stats.rate_limited, 0)
+
+    def test_one_noisy_device_does_not_silence_another(self):
+        ref = self.build()
+        for index in range(reflector.REFLECT_BURST + 100):
+            ref._reflect(reflector.MDNS, "wlan1", f"flood-{index}".encode(), "10.42.7.50")
+        before = ref.stats.rate_limited
+        ref._reflect(reflector.MDNS, "wlan1", b"a polite query", "10.42.7.51")
+        self.assertEqual(ref.stats.rate_limited, before, "a quiet device is unaffected")
+
+    def test_the_gateway_own_packets_are_still_ignored_first(self):
+        ref = self.build()
+        ref._reflect(reflector.MDNS, "wlan1", b"reflected back", "10.42.7.1")
+        self.assertEqual(ref.stats.self_originated, 1)
+        self.assertEqual(ref.stats.rate_limited, 0)
 
 
 if __name__ == "__main__":

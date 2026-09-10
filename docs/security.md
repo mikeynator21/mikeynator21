@@ -115,6 +115,12 @@ whatever else the machine runs (ssh, say) keeps working; the point is that
 nothing *we* opened answers the hotel LAN. Clients on the hotspot reach the
 internet through that network without reaching the hosts on it.
 
+**A guest device flooding the network it was separated from.** Reflection
+copies each discovery packet onto every other network, so it is a multiplier
+by design. Deduplication only catches an identical packet — changing one byte
+defeats it — so reflection is rate-limited per source address, with a burst
+allowance for the flurry a device sends when it joins.
+
 **Resource exhaustion by a device on your own network.** A DNS-over-TCP
 connection stays open between queries, so TCP has its own workers and its own
 ceiling — in total and per client. Without that, a handful of connections

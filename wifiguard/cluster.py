@@ -370,21 +370,37 @@ class Cluster:
                 return
 
             try:
-                envelope = json.loads(payload.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                continue
-            if not isinstance(envelope, dict):
-                continue
-
-            message = self._verify(envelope)
-            if message is None:
-                log.debug("rejected an unauthenticated cluster message from %s", peer[0])
-                continue
-
-            try:
-                self._handle(message, peer[0])
+                self._receive(payload, peer[0])
             except Exception:  # noqa: BLE001
-                log.debug("failed to handle a cluster message", exc_info=True)
+                # Nothing a sender can put in a packet may end this thread. A
+                # listener that dies stops hearing heartbeats, decides every
+                # peer is gone, and promotes itself -- so a crash here does not
+                # look like a crash, it looks like a split brain.
+                self.rejected += 1
+                log.debug("failed to handle a cluster packet", exc_info=True)
+
+    def _receive(self, payload: bytes, sender: str) -> None:
+        """Authenticate one packet and act on it. Everything here is untrusted."""
+        try:
+            envelope = json.loads(payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return
+        except RecursionError:
+            # Deeply nested JSON exhausts the parser's stack. It arrives before
+            # any signature has been checked, so this needs no secret at all:
+            # 60 kB of open brackets, inside the size cap, and unhandled it
+            # would take the listener with it.
+            log.debug("rejected a cluster packet nested too deeply, from %s", sender)
+            return
+        if not isinstance(envelope, dict):
+            return
+
+        message = self._verify(envelope)
+        if message is None:
+            log.debug("rejected an unauthenticated cluster message from %s", sender)
+            return
+
+        self._handle(message, sender)
 
     def _handle(self, message: dict, sender: str) -> None:
         kind = message.get("type")
