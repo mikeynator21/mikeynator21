@@ -84,7 +84,7 @@ wifiguard fieldtest   # what is this network doing to my DNS right now?
 ```
 
 `selftest` runs the real resolver, the real cache and the real firewall
-generator against a stub upstream on loopback, and reports 42 checks. It is
+generator against a stub upstream on loopback, and reports 55 checks. It is
 the honest answer to "did that work?"
 
 Docker, if you prefer:
@@ -339,7 +339,7 @@ Worked examples are in [deploy/examples/](deploy/examples/).
 Three layers, each proving something the one below it cannot.
 
 ```bash
-python3 -m unittest discover -s tests -v      # 357 unit tests, no network needed
+python3 -m unittest discover -s tests -v      # 472 unit tests, no network needed
 wifiguard selftest                            # 55 checks, the real stack on loopback
 sudo ./tests/integration/run.sh               # 66 checks on a virtual network
 ```
