@@ -1,0 +1,43 @@
+# The simplest way to run WiFiGuard on a home server or NAS.
+#
+#   docker compose up -d
+#   docker compose exec wifiguard wifiguard status
+#
+# Then point your router's DHCP "DNS server" setting at this host, and every
+# device on every network behind that router is filtered.
+
+services:
+  wifiguard:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: wifiguard
+    restart: unless-stopped
+
+    # Host networking so the resolver sees real client addresses. Without it
+    # every query appears to come from the Docker bridge and per-device rules
+    # cannot work.
+    network_mode: host
+
+    cap_add:
+      - NET_ADMIN          # nftables rules and the WireGuard interface
+      - NET_BIND_SERVICE   # port 53
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    volumes:
+      - wifiguard-state:/var/lib/wifiguard
+      - ./wifiguard.toml:/etc/wifiguard/wifiguard.toml:ro
+      # Only needed when the VPN is in use.
+      - /etc/wireguard:/etc/wireguard
+
+    sysctls:
+      net.ipv4.ip_forward: "1"
+
+    environment:
+      WIFIGUARD_STATE: /var/lib/wifiguard
+
+volumes:
+  wifiguard-state:

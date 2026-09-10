@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WiFiGuard</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --ink: #14171c;
+  --muted: #5c6673;
+  --line: #e3e7ec;
+  --accent: #2f6feb;
+  --block: #d1453b;
+  --allow: #1f9254;
+  --warn: #b26a00;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c;
+    --panel: #1c2027;
+    --ink: #e6e9ee;
+    --muted: #9aa4b2;
+    --line: #2a2f38;
+    --accent: #5a8dfb;
+    --block: #f0675c;
+    --allow: #46c07d;
+    --warn: #e0a33a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 10;
+}
+header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: -0.01em; }
+header .spacer { flex: 1; }
+.badge {
+  font-size: 12px; padding: 3px 9px; border-radius: 999px;
+  border: 1px solid var(--line); color: var(--muted);
+}
+.badge.live { color: var(--allow); border-color: currentColor; }
+.badge.down { color: var(--block); border-color: currentColor; }
+main { padding: 20px; max-width: 1200px; margin: 0 auto; }
+.grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+.card {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 14px 16px;
+}
+.card h2 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+.stat { font-size: 28px; font-weight: 650; letter-spacing: -0.02em; }
+.stat small { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6px; }
+section { margin-top: 22px; }
+section > h2 { font-size: 14px; margin: 0 0 10px; font-weight: 650; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12px;
+  padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: none; }
+.name { font-family: ui-monospace, "SF Mono", Menlo, monospace; word-break: break-all; }
+.tag { font-size: 11px; padding: 2px 7px; border-radius: 999px; font-weight: 600;
+  border: 1px solid currentColor; white-space: nowrap; }
+.tag.block { color: var(--block); }
+.tag.allow { color: var(--allow); }
+.tag.rewrite, .tag.local { color: var(--warn); }
+.tag.error { color: var(--muted); }
+.muted { color: var(--muted); }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+input, select, button {
+  font: inherit; padding: 7px 10px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+}
+input { min-width: 0; }
+button { cursor: pointer; font-weight: 550; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: 0.5; cursor: default; }
+.scroll { max-height: 460px; overflow: auto; }
+.split { display: grid; gap: 14px; grid-template-columns: 1fr 1fr; }
+@media (max-width: 800px) { .split { grid-template-columns: 1fr; } main { padding: 14px; } }
+.bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 8px; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+#result { margin-top: 10px; font-size: 13px; }
+.peer { display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  padding: 10px 0; border-bottom: 1px solid var(--line); }
+.peer:last-child { border-bottom: none; }
+.peer img { width: 132px; height: 132px; border-radius: 8px; background: #fff; padding: 4px; }
+.peer .meta { flex: 1; min-width: 180px; }
+.error-banner { background: var(--block); color: #fff; padding: 10px 16px; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>WiFiGuard</h1>
+  <span class="badge" id="protection">—</span>
+  <span class="badge" id="uptime">—</span>
+  <span class="spacer"></span>
+  <span class="badge" id="health">connecting</span>
+</header>
+
+<div class="error-banner" id="banner" hidden></div>
+
+<main>
+  <div class="grid">
+    <div class="card"><h2>Queries</h2><div class="stat" id="total">—</div>
+      <div class="muted" id="rate"></div></div>
+    <div class="card"><h2>Blocked</h2><div class="stat" id="blocked" style="color:var(--block)">—</div>
+      <div class="bar"><i id="blockbar" style="width:0;background:var(--block)"></i></div>
+      <div class="muted" id="blockrate"></div></div>
+    <div class="card"><h2>Answered from cache</h2><div class="stat" id="cached">—</div>
+      <div class="bar"><i id="cachebar" style="width:0"></i></div>
+      <div class="muted" id="cacherate"></div></div>
+    <div class="card"><h2>Never left the network</h2><div class="stat" id="avoided">—</div>
+      <div class="muted">queries that cost no upstream traffic</div></div>
+    <div class="card"><h2>Block rules</h2><div class="stat" id="rules">—</div>
+      <div class="muted" id="sources"></div></div>
+    <div class="card"><h2>Upstream</h2><div id="upstreams" class="muted">—</div></div>
+  </div>
+
+  <section>
+    <h2>Why was this blocked?</h2>
+    <div class="card">
+      <form class="row" id="checkform">
+        <input id="checkname" placeholder="doubleclick.net" style="flex:1" autocomplete="off">
+        <input id="checkclient" placeholder="client IP (optional)" style="width:190px" autocomplete="off">
+        <button class="primary" type="submit">Check</button>
+      </form>
+      <div id="result"></div>
+    </div>
+  </section>
+
+  <section id="gatewaysection" hidden>
+    <h2>Gateway</h2>
+    <div class="card"><div id="gateway"></div></div>
+  </section>
+
+  <div class="split" style="margin-top:22px">
+    <section style="margin:0">
+      <h2>Most blocked</h2>
+      <div class="card scroll"><table><tbody id="topblocked"></tbody></table></div>
+    </section>
+    <section style="margin:0">
+      <h2>Devices</h2>
+      <div class="card scroll"><table><tbody id="clients"></tbody></table></div>
+    </section>
+  </div>
+
+  <section id="vpnsection" hidden>
+    <h2>VPN peers</h2>
+    <div class="card"><div id="peers"></div></div>
+  </section>
+
+  <section>
+    <h2>Recent queries</h2>
+    <div class="card">
+      <div class="row" style="margin-bottom:10px">
+        <select id="filter">
+          <option value="">Everything</option>
+          <option value="block">Blocked only</option>
+          <option value="allow">Allowed only</option>
+        </select>
+        <input id="clientfilter" placeholder="filter by client" style="width:170px" autocomplete="off">
+        <label class="row" style="gap:5px"><input type="checkbox" id="autorefresh" checked
+          style="width:auto"> live</label>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Time</th><th>Client</th><th>Name</th><th>Type</th><th>Result</th><th>Why</th></tr></thead>
+          <tbody id="queries"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const number = (value) => (value ?? 0).toLocaleString();
+const percent = (value) => `${((value ?? 0) * 100).toFixed(1)}%`;
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  if (!response.ok) {
+    let detail = response.statusText;
+    try { detail = (await response.json()).error || detail; } catch (_) { /* not JSON */ }
+    throw new Error(detail);
+  }
+  return response.json();
+}
+
+function showError(message) {
+  const banner = $("banner");
+  if (!message) { banner.hidden = true; return; }
+  banner.textContent = message;
+  banner.hidden = false;
+}
+
+function duration(seconds) {
+  if (!seconds) return "—";
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function cell(text, className) {
+  const td = document.createElement("td");
+  if (className) td.className = className;
+  td.textContent = text;
+  return td;
+}
+
+async function refreshStatus() {
+  const status = await api("/api/status");
+  const counters = status.counters;
+
+  $("protection").textContent = status.protection;
+  $("uptime").textContent = `up ${duration(status.uptime_seconds)}`;
+  $("health").textContent = "live";
+  $("health").className = "badge live";
+
+  $("total").textContent = number(counters.total);
+  $("blocked").textContent = number(counters.blocked);
+  $("cached").textContent = number(counters.cached);
+  $("avoided").textContent = number(counters.upstream_queries_avoided);
+  $("rules").textContent = number(status.blocklists.rules);
+
+  $("blockrate").textContent = `${percent(counters.block_rate)} of all queries`;
+  $("cacherate").textContent = `${percent(counters.cache_rate)} of all queries`;
+  $("blockbar").style.width = percent(counters.block_rate);
+  $("cachebar").style.width = percent(counters.cache_rate);
+
+  const failed = status.blocklists.sources.filter((source) => source.error);
+  $("sources").textContent = failed.length
+    ? `${status.blocklists.sources.length} sources, ${failed.length} failed`
+    : `${status.blocklists.sources.length} sources`;
+
+  $("upstreams").innerHTML = "";
+  for (const upstream of status.upstreams) {
+    const line = document.createElement("div");
+    const state = upstream.available ? "ok" : "unavailable";
+    const lock = upstream.encrypted ? "encrypted" : "PLAINTEXT";
+    line.textContent = `${upstream.spec} · ${upstream.latency_ms || "—"}ms · ${lock} · ${state}`;
+    line.style.color = upstream.available ? "" : "var(--block)";
+    line.style.fontSize = "12px";
+    $("upstreams").appendChild(line);
+  }
+
+  if (status.gateway) {
+    $("gatewaysection").hidden = false;
+    const gateway = status.gateway;
+    $("gateway").innerHTML = "";
+    const rows = [
+      ["SSID", gateway.ssid],
+      ["Access point", `${gateway.ap_interface} · ${gateway.subnet}`],
+      ["Uplink", gateway.uplink_interface || "not connected"],
+      ["Firewall", gateway.rules_applied ? "active" : "NOT APPLIED"],
+      ["Kill switch", gateway.vpn_interface ? `traffic pinned to ${gateway.vpn_interface}` : "off"],
+      ["Network changes", `${gateway.uplink_changes} since start`],
+      ["Connected devices", String((gateway.clients || []).length)],
+    ];
+    for (const [label, value] of rows) {
+      const line = document.createElement("div");
+      line.innerHTML = `<span class="muted">${label}:</span> `;
+      line.appendChild(document.createTextNode(value));
+      $("gateway").appendChild(line);
+    }
+  }
+
+  if (status.vpn) {
+    $("vpnsection").hidden = false;
+    renderPeers(status.vpn.peers || []);
+  }
+}
+
+function renderPeers(peers) {
+  const container = $("peers");
+  container.innerHTML = "";
+  if (!peers.length) {
+    container.innerHTML = '<div class="muted">No peers yet. Add one with '
+      + '<code>wifiguard vpn add-peer phone --mobile</code>.</div>';
+    return;
+  }
+  for (const peer of peers) {
+    const row = document.createElement("div");
+    row.className = "peer";
+
+    const image = document.createElement("img");
+    image.src = `/api/vpn/peers/${encodeURIComponent(peer.name)}/qr.svg`;
+    image.alt = `WireGuard QR code for ${peer.name}`;
+    image.loading = "lazy";
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const state = peer.connected ? "connected" : (peer.last_handshake ? "idle" : "never connected");
+    meta.innerHTML = `<div style="font-weight:600">${peer.name}</div>`;
+    const detail = document.createElement("div");
+    detail.className = "muted";
+    detail.style.fontSize = "12px";
+    detail.textContent = `${peer.address} · ${peer.profile} · ${state}`
+      + (peer.preshared_key ? " · pre-shared key" : "");
+    meta.appendChild(detail);
+
+    const link = document.createElement("a");
+    link.href = `/api/vpn/peers/${encodeURIComponent(peer.name)}/config`;
+    link.textContent = "download .conf";
+    link.style.fontSize = "12px";
+    meta.appendChild(link);
+
+    row.append(image, meta);
+    container.appendChild(row);
+  }
+}
+
+async function refreshQueries() {
+  const params = new URLSearchParams({ limit: "120" });
+  if ($("filter").value) params.set("action", $("filter").value);
+  if ($("clientfilter").value.trim()) params.set("client", $("clientfilter").value.trim());
+
+  const { queries } = await api(`/api/queries?${params}`);
+  const body = $("queries");
+  body.innerHTML = "";
+  for (const entry of queries) {
+    const row = document.createElement("tr");
+    row.appendChild(cell(new Date(entry.ts * 1000).toLocaleTimeString(), "muted"));
+    row.appendChild(cell(entry.client, "name"));
+    row.appendChild(cell(entry.name || "(not logged)", "name"));
+    row.appendChild(cell(entry.type, "muted"));
+
+    const result = document.createElement("td");
+    const tag = document.createElement("span");
+    tag.className = `tag ${entry.action}`;
+    tag.textContent = entry.cached && entry.action === "allow" ? "cached" : entry.action;
+    result.appendChild(tag);
+    row.appendChild(result);
+
+    row.appendChild(cell(entry.rule || entry.reason || "", "muted"));
+    body.appendChild(row);
+  }
+}
+
+async function refreshTop() {
+  const { top } = await api("/api/top?action=block&limit=20");
+  const body = $("topblocked");
+  body.innerHTML = "";
+  for (const entry of top) {
+    const row = document.createElement("tr");
+    row.appendChild(cell(entry.name, "name"));
+    row.appendChild(cell(number(entry.count), "muted"));
+
+    const actions = document.createElement("td");
+    actions.style.textAlign = "right";
+    const button = document.createElement("button");
+    button.textContent = "allow";
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        await api("/api/allow", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ domain: entry.name }),
+        });
+        button.textContent = "allowed";
+      } catch (error) {
+        showError(`Could not allow ${entry.name}: ${error.message}`);
+        button.disabled = false;
+      }
+    };
+    actions.appendChild(button);
+    row.appendChild(actions);
+    body.appendChild(row);
+  }
+}
+
+async function refreshClients() {
+  const data = await api("/api/clients");
+  const leases = new Map((data.leases || []).map((lease) => [lease.ip, lease]));
+  const body = $("clients");
+  body.innerHTML = "";
+  for (const entry of data.clients) {
+    const lease = leases.get(entry.client);
+    const row = document.createElement("tr");
+    row.appendChild(cell(lease && lease.hostname ? lease.hostname : entry.client, "name"));
+    row.appendChild(cell(lease ? entry.client : "", "muted"));
+    row.appendChild(cell(`${number(entry.count)} queries`, "muted"));
+    body.appendChild(row);
+  }
+  if (!data.clients.length) {
+    body.innerHTML = '<tr><td class="muted">No queries yet.</td></tr>';
+  }
+}
+
+$("checkform").onsubmit = async (event) => {
+  event.preventDefault();
+  const name = $("checkname").value.trim();
+  if (!name) return;
+  const params = new URLSearchParams({ name });
+  if ($("checkclient").value.trim()) params.set("client", $("checkclient").value.trim());
+  try {
+    const result = await api(`/api/check?${params}`);
+    const verdict = result.action === "block" ? "BLOCKED" : result.action.toUpperCase();
+    const colour = result.action === "block" ? "var(--block)" : "var(--allow)";
+    $("result").innerHTML =
+      `<strong style="color:${colour}">${verdict}</strong> — `
+      + `${result.reason || "no rule matched"}`
+      + (result.rule ? ` <span class="name">(${result.rule})</span>` : "")
+      + `<div class="muted">group: ${result.group}`
+      + (result.source ? ` · source: ${result.source}` : "") + `</div>`;
+  } catch (error) {
+    $("result").innerHTML = `<span style="color:var(--block)">${error.message}</span>`;
+  }
+};
+
+async function tick() {
+  try {
+    await Promise.all([refreshStatus(), refreshTop(), refreshClients()]);
+    if ($("autorefresh").checked) await refreshQueries();
+    showError("");
+  } catch (error) {
+    $("health").textContent = "unreachable";
+    $("health").className = "badge down";
+    showError(`Cannot reach WiFiGuard: ${error.message}`);
+  }
+}
+
+$("filter").onchange = refreshQueries;
+$("clientfilter").oninput = () => { clearTimeout(window._debounce);
+  window._debounce = setTimeout(refreshQueries, 300); };
+
+tick();
+setInterval(tick, 5000);
+</script>
+</body>
+</html>

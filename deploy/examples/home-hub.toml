@@ -1,0 +1,87 @@
+# An always-on box at home: a Raspberry Pi, a NAS, an old mini PC.
+#
+# This is the setup that covers everything. Point your router's DHCP "DNS
+# server" at this machine and every device on every network behind the router
+# is filtered, with no software installed on any of them. Add the VPN and your
+# phone keeps that protection on cellular and on other people's WiFi.
+
+protection = "strict"
+state_dir = "/var/lib/wifiguard"
+
+[server]
+listen_addresses = ["auto"]
+port = 53
+workers = 48
+
+[networks]
+# A modem with several SSIDs often means several subnets. Discovery covers
+# every one this machine is attached to.
+discover_local = true
+route_to_vpn_peers = true
+
+# Subnets behind the router that this machine is not directly on -- a VLAN, or
+# a second access point on its own range.
+extra_networks = []
+
+# Filter the guest network harder than the main one.
+# group_by_network = { "192.168.4.0/24" = "guest" }
+
+[upstream]
+servers = [
+    "https://dns.quad9.net/dns-query",
+    "https://dns.cloudflare.com/dns-query",
+    "tls://dns.quad9.net@9.9.9.9",
+]
+require_encrypted = true
+tls_profile = "strict"
+
+[cache]
+min_ttl = 300
+max_entries = 200000
+prefetch_after = 0.9
+
+[vpn]
+enabled = true
+endpoint = "home.example.com"     # a dynamic-DNS name is fine
+subnet = "10.9.0.0/24"
+listen_port = 51820
+
+[dashboard]
+enabled = true
+address = "0.0.0.0"
+port = 8080
+password = "change-me"
+
+[logging]
+log_queries = true
+retention_days = 7
+
+# -- Per-device rules ---------------------------------------------------------
+
+[groups.kids]
+block_categories = ["adult", "gambling", "social"]
+safe_search = true
+youtube_restrict = "moderate"
+
+[groups.kids.schedules.bedtime]
+start = "21:30"
+end = "07:00"
+block_all = true
+
+[groups.guest]
+block_categories = ["adult"]
+
+[groups.iot]
+# A smart plug has no business resolving anything but its vendor.
+default_deny = true
+allow = ["*.tuya.com", "*.hue.philips.com", "pool.ntp.org"]
+
+[[devices]]
+id = "192.168.1.40"
+group = "kids"
+label = "Tablet"
+
+[[devices]]
+id = "tv-*"
+group = "iot"
+label = "Smart TV"

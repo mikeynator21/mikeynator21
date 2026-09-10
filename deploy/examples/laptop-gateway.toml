@@ -1,0 +1,62 @@
+# A laptop as a portable filtering router.
+#
+# The laptop joins whatever network is available -- home, a cafe, a hotel, a
+# phone's tether -- and re-shares it as its own WiFi. Everything that joins
+# that hotspot is filtered, isolated from the untrusted network the laptop
+# joined, and follows the laptop from network to network without reconfiguring
+# anything.
+#
+# You need a second wireless adapter (a cheap USB one is fine): one radio joins
+# the network, the other runs the hotspot.
+
+protection = "strict"
+
+[server]
+listen_addresses = ["auto"]
+port = 53
+
+[hotspot]
+enabled = true
+ssid = "WiFiGuard"
+passphrase = "choose-a-long-passphrase"
+
+# Leave both empty and they are worked out live: the access point picks a
+# wireless adapter that is not carrying the uplink, and the uplink follows
+# whatever holds the default route.
+interface = ""
+uplink = ""
+
+# Leave empty to pick a subnet that does not clash with the network you joined
+# -- important, because hotel networks are almost always 192.168.0.0/24.
+subnet = ""
+
+country_code = "US"
+band = "2.4"
+isolate_from_uplink = true    # hotel LANs are hostile; keep clients away
+allow_ipv6 = false            # no unfiltered v6 path around the filter
+
+# Set this once the VPN below is running: client traffic is then pinned to the
+# tunnel, and dropped if the tunnel goes down rather than leaking in the clear.
+route_through_vpn = false
+
+[upstream]
+servers = [
+    "https://dns.quad9.net/dns-query",
+    "https://dns.cloudflare.com/dns-query",
+]
+require_encrypted = true
+
+[cache]
+# On a tethered or metered uplink, hold answers longer.
+min_ttl = 600
+serve_stale_for = 86400
+
+[dashboard]
+enabled = true
+address = "127.0.0.1"
+port = 8080
+
+# Uncomment once you have run `wifiguard vpn init --endpoint <your-address>`.
+# [vpn]
+# enabled = true
+# endpoint = "home.example.com"

@@ -1,0 +1,33 @@
+# Default configuration for the Docker image.
+# Serves DNS to every device on every network behind your router.
+
+protection = "strict"
+
+[server]
+# "auto" binds every local address, so devices on the 2.4GHz SSID, the 5GHz
+# SSID, the guest network and the wired LAN can all reach the resolver.
+listen_addresses = ["auto"]
+port = 53
+
+[networks]
+discover_local = true
+
+[upstream]
+servers = [
+    "https://dns.quad9.net/dns-query",
+    "https://dns.cloudflare.com/dns-query",
+    "tls://dns.quad9.net@9.9.9.9",
+]
+require_encrypted = true
+tls_profile = "strict"
+
+[cache]
+min_ttl = 300
+max_entries = 200000
+
+[dashboard]
+enabled = true
+address = "0.0.0.0"
+port = 8080
+# Reachable from the LAN, so it needs a password.
+password = "change-me"

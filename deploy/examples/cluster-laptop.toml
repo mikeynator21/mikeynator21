@@ -1,0 +1,33 @@
+# Node A: the laptop. Higher priority while it is in use, steps aside when it
+# is not, so the always-on phone answers instead.
+#
+# Generate the shared secret once with `wifiguard cluster secret` and use the
+# same value on every node.
+
+protection = "strict"
+
+[server]
+listen_addresses = ["auto"]
+port = 53
+
+[cluster]
+enabled = true
+name = "laptop"
+address = "10.9.0.1"          # this node, as the other nodes reach it
+peers = ["10.9.0.3"]          # the phone
+priority = 90                 # wins while the laptop is awake and in use
+
+# The handoff: after five minutes with no sign of use, this node drops to the
+# bottom of the list and clients start asking the phone first. Nothing is
+# interrupted -- every node keeps answering, this only changes the order they
+# are tried in.
+yield_when_idle = true
+idle_after = 300
+yield_on_battery = false
+
+share_cache = true            # each name is fetched once per cluster
+secret = "replace-with-wifiguard-cluster-secret"
+
+[vpn]
+enabled = true
+endpoint = "home.example.com"

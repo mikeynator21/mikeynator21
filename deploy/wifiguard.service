@@ -1,0 +1,45 @@
+[Unit]
+Description=WiFiGuard filtering resolver and gateway
+Documentation=https://github.com/mikeynator21/wifiguard
+After=network-online.target
+Wants=network-online.target
+# systemd-resolved wants port 53 for itself.
+Conflicts=systemd-resolved.service
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/wifiguard run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# Binding port 53 and managing nftables is all this needs; everything else is
+# dropped so a bug in the resolver cannot become a root compromise.
+User=root
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK AF_PACKET
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io
+SystemCallErrorNumber=EPERM
+
+StateDirectory=wifiguard
+ConfigurationDirectory=wifiguard
+ReadWritePaths=/var/lib/wifiguard /etc/wireguard
+
+[Install]
+WantedBy=multi-user.target

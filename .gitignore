@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Runtime state: caches, leases, query logs, keys.
+/var/
+*.db
+*.db-wal
+*.db-shm
+dnscache.bin
+leases.json
+peers.json
+local-rules.json
+
+# Local configuration, which may hold passphrases and secrets.
+/wifiguard.toml
+!deploy/wifiguard.toml
+!deploy/examples/*.toml

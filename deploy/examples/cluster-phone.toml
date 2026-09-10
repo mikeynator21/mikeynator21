@@ -1,0 +1,31 @@
+# Node B: the phone, under Termux. Lower priority, but always on -- so it picks
+# up the moment the laptop stops answering.
+#
+# Android without root cannot bind port 53 or install firewall rules, so this
+# node serves on 5353 and is reached over the VPN rather than transparently.
+
+protection = "strict"
+state_dir = "~/.wifiguard/state"
+
+[server]
+listen_addresses = ["127.0.0.1"]
+port = 5353
+workers = 8
+
+[cluster]
+enabled = true
+name = "phone"
+address = "10.9.0.3"
+peers = ["10.9.0.1"]
+priority = 40                 # below the laptop, so it defers while that is up
+yield_when_idle = false       # a phone is always available; never step aside
+share_cache = true
+secret = "replace-with-wifiguard-cluster-secret"
+
+[cache]
+min_ttl = 900                 # battery and mobile data both favour a long TTL
+max_entries = 20000
+
+[logging]
+log_queries = false
+retention_days = 1

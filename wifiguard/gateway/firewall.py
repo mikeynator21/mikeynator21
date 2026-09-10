@@ -1,0 +1,267 @@
+"""Firewall and NAT rules that turn the laptop into a filtering gateway.
+
+The whole ruleset lives in tables named `wifiguard*` and is applied atomically
+with `nft -f`, so it can be torn down cleanly without disturbing anything else
+the host has configured. Nothing is flushed that we did not create.
+
+Beyond plain NAT, these rules are what make the filter hold against a client
+that would rather not be filtered:
+
+* port 53 from clients is redirected to us, so a device with a hardcoded
+  resolver is answered by us anyway;
+* port 853 (DNS-over-TLS) is rejected, so the Android "Private DNS" setting
+  fails closed and falls back to the network resolver;
+* known DoH endpoint addresses are rejected, which catches the browsers that
+  ship a resolver IP rather than resolving a bootstrap name;
+* IPv6 forwarding for clients is dropped unless explicitly enabled, because a
+  v6 path around an IPv4-only filter is the easiest leak of all.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import logging
+import shutil
+import subprocess
+from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
+
+NAT_TABLE = "wifiguard"
+FILTER_TABLE = "wifiguard_filter"
+
+# Addresses that serve public DNS-over-HTTPS. Blocking the bootstrap *names* in
+# the blocklist covers clients that resolve them; this covers the ones that ship
+# the address itself. Kept short and well-known on purpose -- it is a backstop,
+# not an attempt to enumerate the internet.
+DOH_ENDPOINT_ADDRESSES = [
+    "8.8.8.8", "8.8.4.4",              # Google
+    "1.1.1.1", "1.0.0.1",              # Cloudflare
+    "1.1.1.2", "1.0.0.2",              # Cloudflare malware-filtering
+    "1.1.1.3", "1.0.0.3",              # Cloudflare family
+    "9.9.9.9", "149.112.112.112",      # Quad9
+    "208.67.222.222", "208.67.220.220",  # OpenDNS
+    "94.140.14.14", "94.140.15.15",    # AdGuard
+    "185.228.168.9", "185.228.169.9",  # CleanBrowsing
+    "76.76.2.0", "76.76.10.0",         # Control D
+    "45.90.28.0", "45.90.30.0",        # NextDNS
+]
+
+DOH_ENDPOINT_ADDRESSES_V6 = [
+    "2001:4860:4860::8888", "2001:4860:4860::8844",
+    "2606:4700:4700::1111", "2606:4700:4700::1001",
+    "2620:fe::fe", "2620:fe::9",
+    "2a10:50c0::ad1:ff", "2a10:50c0::ad2:ff",
+]
+
+
+class FirewallError(RuntimeError):
+    """A firewall command failed."""
+
+
+@dataclass
+class GatewayRules:
+    """Everything the ruleset needs to know about the current topology."""
+
+    ap_interface: str
+    uplink_interface: str
+    subnet: ipaddress.IPv4Network
+    dns_port: int = 53
+    dashboard_port: int = 8080
+    #: Force client traffic out through this interface (a WireGuard tunnel).
+    #: When set, traffic is dropped whenever the tunnel is down -- a kill switch.
+    vpn_interface: str | None = None
+    #: Reject DoT and known DoH endpoints so clients cannot bypass the filter.
+    block_encrypted_dns_bypass: bool = True
+    #: Forward IPv6 for clients. Off by default: an unfiltered v6 path defeats
+    #: the point of the gateway.
+    allow_ipv6: bool = False
+    extra_allowed_ports: list[int] = field(default_factory=list)
+
+
+def nft_available() -> bool:
+    return shutil.which("nft") is not None
+
+
+def _run(command: list[str], stdin: str | None = None, check: bool = True) -> str:
+    try:
+        result = subprocess.run(
+            command, input=stdin, capture_output=True, text=True, timeout=15, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise FirewallError(f"{' '.join(command)}: {exc}") from exc
+    if check and result.returncode != 0:
+        raise FirewallError(
+            f"{' '.join(command)} exited {result.returncode}: {result.stderr.strip()}"
+        )
+    return result.stdout
+
+
+def build_ruleset(rules: GatewayRules) -> str:
+    """Render the complete nftables ruleset for the current topology."""
+    ap = rules.ap_interface
+    uplink = rules.vpn_interface or rules.uplink_interface
+    subnet = str(rules.subnet)
+    router_ip = str(next(rules.subnet.hosts()))
+
+    allowed_input_ports = [rules.dashboard_port, *rules.extra_allowed_ports]
+    dashboard_rules = "\n".join(
+        f'        iifname "{ap}" tcp dport {port} accept' for port in allowed_input_ports
+    )
+
+    bypass_rules = ""
+    if rules.block_encrypted_dns_bypass:
+        v4_set = ", ".join(DOH_ENDPOINT_ADDRESSES)
+        v6_set = ", ".join(DOH_ENDPOINT_ADDRESSES_V6)
+        bypass_rules = f"""
+        # DNS-over-TLS: reject rather than drop, so Android's Private DNS gives
+        # up immediately and falls back to us instead of retrying for a minute.
+        iifname "{ap}" tcp dport 853 reject with tcp reset
+        iifname "{ap}" udp dport 853 reject
+        # DNS-over-QUIC.
+        iifname "{ap}" udp dport 784 reject
+        iifname "{ap}" udp dport 8853 reject
+        # Public resolvers that browsers dial by address rather than by name.
+        iifname "{ap}" ip daddr {{ {v4_set} }} reject with icmp type admin-prohibited
+        iifname "{ap}" ip6 daddr {{ {v6_set} }} reject with icmpv6 type admin-prohibited
+"""
+
+    ipv6_forward = (
+        f'        iifname "{ap}" oifname "{uplink}" accept'
+        if rules.allow_ipv6
+        else f'        iifname "{ap}" drop  # no unfiltered IPv6 path for clients'
+    )
+
+    return f"""#!/usr/sbin/nft -f
+# Generated by WiFiGuard. Do not edit; regenerated whenever the uplink changes.
+
+table ip {NAT_TABLE} {{
+    chain prerouting {{
+        type nat hook prerouting priority dstnat; policy accept;
+
+        # Every DNS query from a client is answered by us, whatever resolver the
+        # device thinks it is talking to.
+        iifname "{ap}" udp dport 53 redirect to :{rules.dns_port}
+        iifname "{ap}" tcp dport 53 redirect to :{rules.dns_port}
+    }}
+
+    chain postrouting {{
+        type nat hook srcnat priority srcnat; policy accept;
+
+        ip saddr {subnet} oifname "{uplink}" masquerade
+    }}
+}}
+
+table inet {FILTER_TABLE} {{
+    chain input {{
+        type filter hook input priority filter; policy accept;
+
+        iifname "lo" accept
+        ct state established,related accept
+
+        # Services the gateway offers to its own clients, and to nobody else.
+        iifname "{ap}" udp dport {{ 53, 67 }} accept
+        iifname "{ap}" tcp dport {rules.dns_port} accept
+        iifname "{ap}" icmp type {{ echo-request, destination-unreachable }} accept
+{dashboard_rules}
+
+        # The dashboard and resolver must never be reachable from the network
+        # the laptop has joined -- that network is untrusted.
+        iifname "{rules.uplink_interface}" tcp dport {{ {rules.dns_port}, {rules.dashboard_port} }} drop
+        iifname "{rules.uplink_interface}" udp dport {rules.dns_port} drop
+    }}
+
+    chain forward {{
+        type filter hook forward priority filter; policy drop;
+
+        ct state established,related accept
+        ct state invalid drop
+{bypass_rules}
+        # Clients reach the internet only through the intended uplink. With a
+        # VPN configured that is the tunnel, so a tunnel that goes down takes
+        # client connectivity with it rather than leaking in the clear.
+        iifname "{ap}" oifname "{uplink}" ip version 4 accept
+{ipv6_forward}
+
+        # Clients must not reach the network the laptop joined. On a hotel or
+        # cafe LAN that is a hostile segment, and this is the isolation that
+        # makes plugging in safe.
+        iifname "{ap}" oifname "{rules.uplink_interface}" drop
+    }}
+
+    chain output {{
+        type filter hook output priority filter; policy accept;
+    }}
+}}
+"""
+
+
+def apply_rules(rules: GatewayRules) -> None:
+    """Install the ruleset, replacing any previous WiFiGuard tables."""
+    if not nft_available():
+        raise FirewallError(
+            "nftables (`nft`) is not installed. Install it with your package "
+            "manager (Debian/Ubuntu: apt install nftables) and try again."
+        )
+
+    teardown()
+    ruleset = build_ruleset(rules)
+    log.debug("applying nftables ruleset:\n%s", ruleset)
+    _run(["nft", "-f", "-"], stdin=ruleset)
+    log.info(
+        "gateway rules applied: %s -> %s (%s)",
+        rules.ap_interface,
+        rules.vpn_interface or rules.uplink_interface,
+        rules.subnet,
+    )
+
+
+def teardown() -> None:
+    """Remove WiFiGuard's tables, leaving every other rule untouched."""
+    if not nft_available():
+        return
+    for family, table in (("ip", NAT_TABLE), ("inet", FILTER_TABLE)):
+        # A table that was never created is not an error worth reporting.
+        _run(["nft", "delete", "table", family, table], check=False)
+
+
+def enable_forwarding(ipv6: bool = False) -> None:
+    """Turn on kernel IP forwarding, without which nothing routes."""
+    settings = {"net.ipv4.ip_forward": "1"}
+    if ipv6:
+        settings["net.ipv6.conf.all.forwarding"] = "1"
+    for key, value in settings.items():
+        try:
+            path = "/proc/sys/" + key.replace(".", "/")
+            with open(path, "w", encoding="ascii") as handle:
+                handle.write(value + "\n")
+        except OSError as exc:
+            raise FirewallError(f"could not set {key}: {exc}") from exc
+
+
+def forwarding_enabled() -> bool:
+    try:
+        with open("/proc/sys/net/ipv4/ip_forward", encoding="ascii") as handle:
+            return handle.read().strip() == "1"
+    except OSError:
+        return False
+
+
+def rules_installed() -> bool:
+    """Whether our tables are currently loaded."""
+    if not nft_available():
+        return False
+    output = _run(["nft", "list", "tables"], check=False)
+    return NAT_TABLE in output
+
+
+def describe() -> str:
+    """The live ruleset, for the dashboard and for `wifiguard status`."""
+    if not nft_available():
+        return "nftables is not available on this host"
+    parts = []
+    for family, table in (("ip", NAT_TABLE), ("inet", FILTER_TABLE)):
+        output = _run(["nft", "list", "table", family, table], check=False)
+        if output:
+            parts.append(output)
+    return "\n".join(parts) or "no WiFiGuard rules are loaded"
