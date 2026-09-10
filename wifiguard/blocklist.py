@@ -24,7 +24,7 @@ from typing import Iterable, NamedTuple
 
 log = logging.getLogger(__name__)
 
-USER_AGENT = "WiFiGuard/1.0 (+https://github.com/mikeynator21/wifiguard)"
+USER_AGENT = "WiFiGuard/1.0 (+https://github.com/mikeynator21/mikeynator21)"
 FETCH_TIMEOUT = 30
 
 # Addresses a hosts file uses to mean "nowhere".  A line pointing at any other

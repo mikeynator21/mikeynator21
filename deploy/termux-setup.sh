@@ -3,7 +3,7 @@
 # WiFiGuard on Android, under Termux. No root required.
 #
 #   pkg install git
-#   git clone https://github.com/mikeynator21/wifiguard
+#   git clone https://github.com/mikeynator21/mikeynator21 wifiguard
 #   bash wifiguard/deploy/termux-setup.sh
 #
 # What this gives you:

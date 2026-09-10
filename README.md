@@ -56,7 +56,7 @@ the phone, and they cover for each other.
 ## Install
 
 ```bash
-git clone https://github.com/mikeynator21/wifiguard
+git clone https://github.com/mikeynator21/mikeynator21 wifiguard
 cd wifiguard
 sudo ./install.sh
 sudo wifiguard setup

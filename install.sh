@@ -2,7 +2,7 @@
 #
 # WiFiGuard installer for Linux (Debian, Ubuntu, Raspberry Pi OS, Fedora, Arch).
 #
-#   curl -fsSL https://raw.githubusercontent.com/mikeynator21/wifiguard/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/mikeynator21/mikeynator21/HEAD/install.sh | sudo bash
 #
 # or, from a clone:  sudo ./install.sh
 #
@@ -15,7 +15,7 @@ PREFIX="${PREFIX:-/opt/wifiguard}"
 BINDIR="${BINDIR:-/usr/local/bin}"
 CONFDIR="${CONFDIR:-/etc/wifiguard}"
 STATEDIR="${STATEDIR:-/var/lib/wifiguard}"
-REPO="${REPO:-https://github.com/mikeynator21/wifiguard}"
+REPO="${REPO:-https://github.com/mikeynator21/mikeynator21}"
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33m warning:\033[0m %s\n' "$*" >&2; }
@@ -79,6 +79,9 @@ fi
 "$PYTHON" -m compileall -q "$PREFIX/wifiguard"
 
 # --- launcher -----------------------------------------------------------------
+# /usr/local/bin exists on most systems but not all of them, and BINDIR can be
+# pointed anywhere.
+mkdir -p "$BINDIR"
 cat > "$BINDIR/wifiguard" <<LAUNCHER
 #!/bin/sh
 # WiFiGuard launcher, written by install.sh
@@ -111,10 +114,23 @@ else
 fi
 
 # --- service ------------------------------------------------------------------
+# `systemctl` being present does not mean systemd is running it: a container, a
+# chroot, or WSL without systemd all have the binary and no bus behind it. The
+# install is complete either way, so a failure here is reported, not fatal --
+# `set -e` would otherwise abort a working install with "Host is down".
+SERVICE=no
 if command -v systemctl >/dev/null && [[ -f "$PREFIX/deploy/wifiguard.service" ]]; then
-    install -m 644 "$PREFIX/deploy/wifiguard.service" /etc/systemd/system/wifiguard.service
-    systemctl daemon-reload
-    info "systemd unit installed (not enabled yet)"
+    if install -m 644 "$PREFIX/deploy/wifiguard.service" \
+            /etc/systemd/system/wifiguard.service 2>/dev/null \
+            && systemctl daemon-reload 2>/dev/null; then
+        info "systemd unit installed (not enabled yet)"
+        SERVICE=yes
+    else
+        warn "systemd is not running here, so there is no service to enable"
+        warn "start it yourself with: sudo wifiguard run"
+    fi
+elif [[ -f "$PREFIX/deploy/wifiguard.service" ]]; then
+    warn "no systemd on this machine; start it with: sudo wifiguard run"
 fi
 
 # --- verify -------------------------------------------------------------------
@@ -124,6 +140,21 @@ if "$BINDIR/wifiguard" selftest --port 15353 >/tmp/wifiguard-selftest.log 2>&1; 
 else
     warn "the self-test reported problems; see /tmp/wifiguard-selftest.log"
 fi
+
+if [[ "$SERVICE" == "yes" ]]; then
+    START_COMMAND="sudo systemctl enable --now wifiguard"
+    RESOLVED_NOTE=$'Port 53 is usually held by systemd-resolved. If `doctor` says so:\n  sudo systemctl disable --now systemd-resolved\n  sudo rm -f /etc/resolv.conf\n  echo \'nameserver 127.0.0.1\' | sudo tee /etc/resolv.conf\n'
+else
+    START_COMMAND="sudo wifiguard run"
+    RESOLVED_NOTE=$'If `doctor` says port 53 is already taken, stop whatever holds it\nfirst -- on most systems that is systemd-resolved.\n'
+fi
+
+# `fill` substitutes the two lines that depend on this machine. The heredocs
+# stay quoted so that nothing else in them is expanded by accident.
+fill() {
+    python3 -c 'import os,sys; sys.stdout.write(sys.stdin.read().replace("START_COMMAND", os.environ["START_COMMAND"]).replace("RESOLVED_NOTE", os.environ["RESOLVED_NOTE"]))'
+}
+export START_COMMAND RESOLVED_NOTE
 
 if [[ "${RAN_SETUP:-yes}" == "no" ]]; then
 cat <<'NEXT'
@@ -136,7 +167,7 @@ Or edit /etc/wifiguard/wifiguard.toml by hand -- every setting in it is
 commented.
 NEXT
 else
-cat <<'NEXT'
+fill <<'NEXT'
 
 WiFiGuard is installed and configured.
 
@@ -146,13 +177,9 @@ WiFiGuard is installed and configured.
   wifiguard harden      any weak settings?
 
 Then start it:
-  sudo systemctl enable --now wifiguard
+  START_COMMAND
 
-Port 53 is usually held by systemd-resolved. If `doctor` says so:
-  sudo systemctl disable --now systemd-resolved
-  sudo rm -f /etc/resolv.conf
-  echo 'nameserver 127.0.0.1' | sudo tee /etc/resolv.conf
-
+RESOLVED_NOTE
 For the laptop hotspot or your phone, see docs/laptop-gateway.md and
 docs/phone.md.
 NEXT
