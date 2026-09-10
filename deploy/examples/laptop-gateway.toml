@@ -39,6 +39,12 @@ allow_ipv6 = false            # no unfiltered v6 path around the filter
 # tunnel, and dropped if the tunnel goes down rather than leaking in the clear.
 route_through_vpn = false
 
+[compatibility]
+# Guests bring devices you have never seen. Protecting the essentials means a
+# visitor's phone works on your hotspot without you debugging it.
+protect_essentials = true
+devices = ["apple", "android"]
+
 [upstream]
 servers = [
     "https://dns.quad9.net/dns-query",

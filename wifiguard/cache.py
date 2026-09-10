@@ -30,13 +30,17 @@ from . import dnsmsg
 
 log = logging.getLogger(__name__)
 
-_MAGIC = b"WGDC2"
+_MAGIC = b"WGDC3"
 
 
 class CacheKey(NamedTuple):
     name: str
     qtype: int
     qclass: int
+    #: Whether the stored answer carries DNSSEC records. A validating client
+    #: that is handed an unsigned answer treats it as an attack, so signed and
+    #: unsigned answers for the same name are different cache entries.
+    dnssec: bool = False
 
 
 @dataclass
@@ -254,6 +258,7 @@ class DNSCache:
                 {
                     "name": key.name,
                     "type": dnsmsg.type_name(key.qtype),
+                    "dnssec": key.dnssec,
                     "hits": entry.hits,
                     "expires_in": max(0, int(entry.expires_at - now)),
                     "stale": now >= entry.expires_at,
@@ -281,7 +286,7 @@ class DNSCache:
                 if len(name) > 0xFFFF or len(entry.wire) > 0xFFFF:
                     continue
                 body += struct.pack("!H", len(name)) + name
-                body += struct.pack("!HH", key.qtype, key.qclass)
+                body += struct.pack("!HHB", key.qtype, key.qclass, int(key.dnssec))
                 body += struct.pack("!ddIIH", entry.stored_at, entry.expires_at, entry.ttl, entry.hits, len(entry.wire))
                 body += entry.wire
                 saved += 1
@@ -326,8 +331,8 @@ class DNSCache:
                     offset += 2
                     name = raw[offset : offset + name_len].decode("utf-8")
                     offset += name_len
-                    qtype, qclass = struct.unpack_from("!HH", raw, offset)
-                    offset += 4
+                    qtype, qclass, dnssec = struct.unpack_from("!HHB", raw, offset)
+                    offset += 5
                     stored_at, expires_at, ttl, hits, wire_len = struct.unpack_from("!ddIIH", raw, offset)
                     offset += struct.calcsize("!ddIIH")
                     wire = raw[offset : offset + wire_len]
@@ -335,7 +340,7 @@ class DNSCache:
 
                     if now >= expires_at:
                         continue
-                    self._entries[CacheKey(name, qtype, qclass)] = CacheEntry(
+                    self._entries[CacheKey(name, qtype, qclass, bool(dnssec))] = CacheEntry(
                         wire=wire,
                         stored_at=stored_at,
                         expires_at=expires_at,

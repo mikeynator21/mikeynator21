@@ -21,6 +21,7 @@ from wifiguard import config as config_module  # noqa: E402
 from wifiguard.app import Application  # noqa: E402
 from wifiguard.gateway import firewall  # noqa: E402
 from wifiguard.gateway.dhcp import DHCPConfig, DHCPServer  # noqa: E402
+from wifiguard.gateway.timeserver import TimeServer  # noqa: E402
 
 AP_INTERFACE = "ap0"
 UPLINK_INTERFACE = "up0"
@@ -78,9 +79,16 @@ def main() -> int:
             dns_servers=[str(next(AP_SUBNET.hosts()))],
             lease_seconds=600,
             lease_file=cfg.lease_file,
+            ntp_servers=[str(next(AP_SUBNET.hosts()))],
+            mtu=1420,
         )
     )
     dhcp.start()
+
+    # 5. Time, so devices with no battery-backed clock can validate a
+    #    certificate at all.
+    time_server = TimeServer(str(next(AP_SUBNET.hosts())), interface=AP_INTERFACE)
+    time_server.start()
 
     # Feed DHCP-learned names and MACs to the policy engine, exactly as the
     # real gateway manager does.
@@ -95,6 +103,7 @@ def main() -> int:
     def shutdown(signum, _frame):
         log.info("stopping")
         stopping.set()
+        time_server.stop()
         dhcp.stop()
         application.stop()
         firewall.teardown()

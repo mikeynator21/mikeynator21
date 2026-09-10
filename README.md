@@ -38,6 +38,10 @@ their own encrypted resolver, which quietly bypasses any network filter. See
 
 **Uses very little bandwidth.** See [Minimal network usage](#minimal-network-usage).
 
+**Works with every device, not just the cooperative ones.** Filtering usually
+gets abandoned because it breaks something. See
+[Keeping devices working](#keeping-devices-working).
+
 **Covers every network on your router.** A modem with a 2.4GHz SSID, a 5GHz
 SSID, a guest network and a wired LAN is often four subnets. All of them are
 discovered and served.
@@ -131,6 +135,45 @@ Also on by default: DNS rebinding protection, ANY-query refusal (the
 amplification vector), per-client rate limiting, and 0x20 case randomisation
 with strict response validation on any plaintext upstream.
 
+## Keeping devices working
+
+A blocklist that swallows the wrong domain breaks a device in a way that gives
+no hint the network is responsible. Three cases do most of the damage, and all
+three are protected by default, ahead of every blocklist, category, group rule
+and schedule:
+
+| | |
+|---|---|
+| **Time** | A device with the wrong clock rejects *every* TLS certificate, so nothing on it works. Cheap hardware has no battery-backed clock and is in that state after each power cut. WiFiGuard also **serves time itself**, because DHCP can only point at an address, never at a name like `pool.ntp.org`. |
+| **Certificate status** | OCSP and CRL lookups happen mid-handshake. Blocked, connections fail or stall for seconds each — experienced as "the internet is slow". |
+| **Connectivity checks** | Every OS probes a known URL to decide if a network works. Block it and the device shows a warning, refuses to stay connected, or falls back to mobile data. |
+
+Push notifications and device activation are protected on the same basis.
+
+```console
+$ wifiguard compat check pool.ntp.org
+pool.ntp.org: PROTECTED -- Network time (NTP)
+
+  A device with the wrong clock rejects every TLS certificate as not yet
+  valid or expired, so nothing on it works and it gives no indication why.
+```
+
+**Devices that validate DNSSEC themselves** get the signatures they asked for.
+Without that they cannot resolve *anything* — and signed and unsigned answers
+are cached separately, so a validating client is never handed an unsigned one.
+
+**Device profiles** cover the vendor domains a class of device needs to
+function, without its telemetry. Opt in to the ones you own:
+
+```toml
+[compatibility]
+devices = ["apple", "smart-tv", "console"]     # or ["all"]
+```
+
+And when something breaks anyway, `wifiguard compat scan` reads the query log
+and flags recent blocks that look like they are breaking a device.
+[Full details](docs/compatibility.md).
+
 ## Per-device rules
 
 Devices are grouped by IP, subnet, MAC or hostname pattern, and each group gets
@@ -186,6 +229,7 @@ wifiguard allow ads.doubleclick.net    # takes effect immediately
 |---|---|
 | [docs/laptop-gateway.md](docs/laptop-gateway.md) | Your laptop as a portable filtering router |
 | [docs/phone.md](docs/phone.md) | Your phone, filtered anywhere; and as a second node |
+| [docs/compatibility.md](docs/compatibility.md) | Keeping every device on the network working |
 | [docs/multi-network.md](docs/multi-network.md) | Covering every network on one modem |
 | [docs/security.md](docs/security.md) | The cryptography, and what it does and does not protect |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | When something breaks |
@@ -207,9 +251,9 @@ Worked examples are in [deploy/examples/](deploy/examples/).
 Three layers, each proving something the one below it cannot.
 
 ```bash
-python3 -m unittest discover -s tests -v      # 225 unit tests, no network needed
-wifiguard selftest                            # 43 checks, the real stack on loopback
-sudo ./tests/integration/run.sh               # 45 checks on a virtual network
+python3 -m unittest discover -s tests -v      # 270 unit tests, no network needed
+wifiguard selftest                            # 55 checks, the real stack on loopback
+sudo ./tests/integration/run.sh               # 58 checks on a virtual network
 ```
 
 **Unit tests** cover the pieces. X25519 is checked against the RFC 7748
@@ -227,7 +271,8 @@ internet, each with its own network stack — and drives it with ordinary tools.
 It is what proves the claims that only hold once a kernel is involved: that a
 device with a hardcoded `8.8.8.8` is answered by us anyway, that DNS-over-TLS
 is refused in milliseconds, that a client can route *through* the network you
-joined without reaching hosts *on* it. See
+joined without reaching hosts *on* it, that a device with no clock can get the
+time, and that a blocklist cannot take that away. See
 [tests/integration/README.md](tests/integration/README.md), including the two
 real bugs it caught that the unit tests could not.
 

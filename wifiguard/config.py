@@ -45,6 +45,28 @@ class ConfigError(ValueError):
 
 
 @dataclass
+class CompatibilitySettings:
+    """Keeping devices working, rather than merely quiet."""
+
+    #: Allow the services devices break without -- time, certificate status,
+    #: connectivity probes, push, activation -- ahead of every other rule.
+    #: Turning this off is how a filtered network becomes a broken one.
+    protect_essentials: bool = True
+    #: Essential categories to stop protecting, by key: time, certificates,
+    #: connectivity, push, activation, dns-infrastructure. Use with care.
+    unprotect: list[str] = field(default_factory=list)
+    #: Device classes on this network, so the minimum each needs to work is
+    #: allowed: apple, android, windows, smart-tv, console, voice-assistant,
+    #: printer, smart-home, streaming -- or "all".
+    devices: list[str] = field(default_factory=list)
+    #: Extra domains to treat as needed for compatibility.
+    allow: list[str] = field(default_factory=list)
+    #: Pass a client's DNSSEC request through to upstream. Without this a
+    #: validating device cannot resolve anything at all.
+    dnssec_passthrough: bool = True
+
+
+@dataclass
 class NetworkSettings:
     """How WiFiGuard finds the other networks on the same router."""
 
@@ -130,6 +152,10 @@ class HotspotSettings:
     #: Stop clients from reaching the network the laptop joined.
     isolate_from_uplink: bool = True
     allow_ipv6: bool = False
+    #: Serve time to clients. Devices with no battery-backed clock cannot
+    #: validate any certificate until they have one, and DHCP can only point
+    #: at an address, not at a name like pool.ntp.org.
+    serve_time: bool = True
     lease_seconds: int = 3600
 
 
@@ -159,6 +185,7 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
     cache: CacheConfig = field(default_factory=CacheConfig)
+    compatibility: CompatibilitySettings = field(default_factory=CompatibilitySettings)
     networks: NetworkSettings = field(default_factory=NetworkSettings)
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
     upstream: UpstreamSettings = field(default_factory=UpstreamSettings)
@@ -220,6 +247,17 @@ class Config:
             discover=self.networks.route_to_vpn_peers,
         )
 
+    def compatibility_guard(self):
+        """Build the guard that keeps devices working."""
+        from .compat import CompatibilityGuard
+
+        return CompatibilityGuard(
+            enabled=self.compatibility.protect_essentials,
+            exclude_services=set(self.compatibility.unprotect),
+            profiles=self.compatibility.devices,
+            extra=self.compatibility.allow,
+        )
+
     def tls_policy(self) -> TLSPolicy:
         return TLSPolicy(profile=self.upstream.tls_profile, pins=self.upstream.pins)  # type: ignore[arg-type]
 
@@ -263,7 +301,8 @@ def from_mapping(raw: dict[str, Any]) -> Config:
     config = Config()
     unknown_top = set(raw) - {
         "protection", "state_dir", "server", "engine", "cache", "upstream",
-        "networks", "cluster", "blocklists", "vpn", "hotspot", "dashboard", "logging",
+        "networks", "cluster", "compatibility", "blocklists", "vpn", "hotspot",
+        "dashboard", "logging",
         "groups", "devices",
     }
     if unknown_top:
@@ -282,6 +321,7 @@ def from_mapping(raw: dict[str, Any]) -> Config:
     _populate(config.server, raw.get("server", {}), "server")
     _populate(config.engine, raw.get("engine", {}), "engine")
     _populate(config.cache, raw.get("cache", {}), "cache")
+    _populate(config.compatibility, raw.get("compatibility", {}), "compatibility")
     _populate(config.networks, raw.get("networks", {}), "networks")
     _populate(config.cluster, raw.get("cluster", {}), "cluster")
     _populate(config.upstream, raw.get("upstream", {}), "upstream")
@@ -376,6 +416,21 @@ def _validate(config: Config) -> None:
             raise ConfigError(
                 f"device {device.identifier!r} is assigned to unknown group "
                 f"{device.group!r}; defined groups are {', '.join(sorted(known_groups))}"
+            )
+
+    from .compat import ESSENTIAL_KEYS, PROFILE_KEYS
+
+    for key in config.compatibility.unprotect:
+        if key not in ESSENTIAL_KEYS:
+            raise ConfigError(
+                f"compatibility.unprotect names unknown service {key!r}; "
+                f"valid keys are {', '.join(ESSENTIAL_KEYS)}"
+            )
+    for key in config.compatibility.devices:
+        if key not in PROFILE_KEYS and key != "all":
+            raise ConfigError(
+                f"compatibility.devices names unknown profile {key!r}; "
+                f"valid profiles are {', '.join(PROFILE_KEYS)}, or \"all\""
             )
 
     if config.cluster.enabled:
@@ -482,6 +537,22 @@ refresh_hours = 168
 block_doh_bypass = true
 allow = ["captive.apple.com", "connectivitycheck.gstatic.com"]
 block = []
+
+[compatibility]
+# Services devices break without -- time, certificate status, connectivity
+# probes, push, activation -- are allowed ahead of every blocklist and group
+# rule. A device that loses its clock rejects every certificate it is shown and
+# gives no clue why, so this is on by default.
+protect_essentials = true
+
+# Device classes on this network, so the minimum each needs to work is allowed:
+# apple, android, windows, smart-tv, console, voice-assistant, printer,
+# smart-home, streaming -- or "all". Run `wifiguard compat devices` to see them.
+devices = []
+
+# Carry a client's DNSSEC request upstream. Without this a device that
+# validates for itself cannot resolve anything at all.
+dnssec_passthrough = true
 
 [engine]
 block_mode = "zero"       # "zero", "nxdomain" or "refused"

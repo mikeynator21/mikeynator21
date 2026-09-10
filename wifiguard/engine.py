@@ -16,8 +16,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from . import dnsmsg
-from .blocklist import BlocklistManager
+from .blocklist import NO_MATCH, BlocklistManager
 from .cache import CacheKey, DNSCache, SingleFlight
+from .compat import CompatibilityGuard
 from .policy import Decision, PolicyEngine
 from .resolver import ResolutionError, UpstreamPool
 from .stats import QueryLog, QueryRecord
@@ -80,6 +81,9 @@ class EngineConfig:
     refuse_any: bool = True
     #: Serve an expired answer when upstream is unreachable.
     serve_stale: bool = True
+    #: Carry a client's DNSSEC request through to upstream. Without it, a
+    #: device that validates for itself cannot resolve anything at all.
+    dnssec_passthrough: bool = True
     upstream_timeout: float = 5.0
 
 
@@ -94,8 +98,14 @@ class FilterEngine:
         cache: DNSCache,
         query_log: QueryLog,
         config: EngineConfig | None = None,
+        compat: CompatibilityGuard | None = None,
     ) -> None:
         self.blocklists = blocklists
+        #: Services devices break without. Consulted before anything else.
+        # Compared against None rather than truth-tested: a guard with
+        # protection switched off has no rules, so `or` would treat it as
+        # absent and quietly substitute an enabled one.
+        self.compat = CompatibilityGuard() if compat is None else compat
         self.policy = policy
         self.upstreams = upstreams
         self.cache = cache
@@ -161,6 +171,11 @@ class FilterEngine:
         name = question.name
         qtype_label = dnsmsg.type_name(question.qtype)
 
+        # A client that says it will validate DNSSEC itself must be given the
+        # signatures, or every lookup it makes fails.
+        want_dnssec = self.config.dnssec_passthrough and dnsmsg.wants_dnssec(query)
+        checking_disabled = header.flags & 0x0010 != 0
+
         def finish(response: bytes | None, action: str, decision: Decision, group: str, cached: bool) -> bytes | None:
             self.query_log.record(
                 QueryRecord(
@@ -197,13 +212,22 @@ class FilterEngine:
                 "block", Decision("block", "DoH canary", CANARY_DOMAIN), "default", False,
             )
 
+        # Services a device breaks without -- its clock, its certificate checks,
+        # its connectivity probe -- are allowed ahead of every other rule,
+        # including a group's own block list and a schedule's block_all. Taking
+        # a device's clock away does not restrict it, it just stops it working.
+        essential = self.compat.match(name)
+        protected = bool(essential) and essential.source.startswith("essential:")
+
         decision, group = self.policy.evaluate(name, client_address)
 
-        if decision.blocked:
+        if decision.blocked and not protected:
             return finish(self._block(query, question), "block", decision, group.name, False)
 
-        if group.filtering and decision.action == "allow":
-            allowed = self.blocklists.is_allowed(name)
+        if protected:
+            decision = Decision("allow", "essential service", essential.rule)
+        elif group.filtering and decision.action == "allow":
+            allowed = self.blocklists.is_allowed(name) or essential
             if not allowed:
                 blocked = self.blocklists.is_blocked(name)
                 if blocked:
@@ -219,7 +243,7 @@ class FilterEngine:
         if local is not None:
             return finish(local, "local", Decision("allow", "local zone"), group.name, True)
 
-        key = CacheKey(name, question.qtype, question.qclass)
+        key = CacheKey(name, question.qtype, question.qclass, want_dnssec)
         hit = self.cache.get(key)
         if hit is not None:
             return finish(
@@ -227,7 +251,9 @@ class FilterEngine:
                 "allow", Decision("allow", "cache"), group.name, True,
             )
 
-        response, from_cache = self._resolve(key, query, question, group.filtering)
+        response, from_cache = self._resolve(
+            key, query, question, group.filtering, checking_disabled=checking_disabled
+        )
         if response is None:
             return finish(
                 dnsmsg.build_error_response(query, dnsmsg.RCODE_SERVFAIL),
@@ -236,7 +262,7 @@ class FilterEngine:
 
         # A tracker reached through a CNAME is blocked on the way back, once the
         # chain is visible.
-        if group.filtering and self.config.uncloak_cnames:
+        if group.filtering and self.config.uncloak_cnames and not protected:
             hidden = self._cname_block(response)
             if hidden is not None:
                 return finish(self._block(query, question), "block", hidden, group.name, False)
@@ -366,7 +392,13 @@ class FilterEngine:
     # -- upstream ---------------------------------------------------------
 
     def _resolve(
-        self, key: CacheKey, query: bytes, question: dnsmsg.Question, filtering: bool
+        self,
+        key: CacheKey,
+        query: bytes,
+        question: dnsmsg.Question,
+        filtering: bool,
+        *,
+        checking_disabled: bool = False,
     ) -> tuple[bytes | None, bool]:
         """Fetch from upstream, collapsing duplicate concurrent lookups."""
         is_leader, event = self._inflight.leader(key)
@@ -382,7 +414,10 @@ class FilterEngine:
 
         try:
             try:
-                response = self.upstreams.resolve(key.name, key.qtype, key.qclass)
+                response = self.upstreams.resolve(
+                    key.name, key.qtype, key.qclass,
+                    want_dnssec=key.dnssec, checking_disabled=checking_disabled,
+                )
             except ResolutionError as exc:
                 log.warning("could not resolve %s: %s", key.name, exc)
                 if self.config.serve_stale:
@@ -407,7 +442,9 @@ class FilterEngine:
 
         def refresh() -> None:
             try:
-                response = self.upstreams.resolve(key.name, key.qtype, key.qclass)
+                response = self.upstreams.resolve(
+                    key.name, key.qtype, key.qclass, want_dnssec=key.dnssec
+                )
                 self.cache.put(key, response)
                 log.debug("prefetched %s/%s", key.name, dnsmsg.type_name(key.qtype))
             except (ResolutionError, dnsmsg.DNSFormatError) as exc:
@@ -436,8 +473,20 @@ class FilterEngine:
             "rule": decision.rule,
         }
 
+        service = self.compat.explain(name)
+        if service is not None:
+            result.update(
+                action="allow",
+                reason="essential service",
+                rule=self.compat.match(name).rule,
+                source=service.title,
+                essential=service.key,
+                why=service.why,
+            )
+            return result
+
         if decision.action == "allow" and group.filtering:
-            allowed = self.blocklists.is_allowed(name)
+            allowed = self.blocklists.is_allowed(name) or self.compat.match(name)
             if allowed:
                 result.update(action="allow", reason="allowlist", rule=allowed.rule, source=allowed.source)
             else:

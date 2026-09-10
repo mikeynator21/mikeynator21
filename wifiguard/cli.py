@@ -127,6 +127,19 @@ def build_parser() -> argparse.ArgumentParser:
     gateway_sub.add_parser("rules", help="print the live firewall rules")
     gateway_sub.add_parser("down", help="remove the firewall rules")
 
+    compat = sub.add_parser(
+        "compat", help="check what might stop a device on the network working"
+    )
+    compat_sub = compat.add_subparsers(dest="compat_command", required=False)
+    compat_sub.add_parser("status", help="what is being protected, and for which devices")
+    compat_check = compat_sub.add_parser("check", help="explain one domain")
+    compat_check.add_argument("domain")
+    compat_sub.add_parser("devices", help="list the device profiles")
+    compat_scan = compat_sub.add_parser(
+        "scan", help="look through recent blocks for anything likely to break a device"
+    )
+    compat_scan.add_argument("--limit", type=int, default=500)
+
     cluster = sub.add_parser(
         "cluster", help="run WiFiGuard on several devices that cover for each other"
     )
@@ -547,6 +560,139 @@ def command_gateway(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def command_compat(args: argparse.Namespace, cfg: Config) -> int:
+    from .compat import DEVICE_PROFILES, ESSENTIAL_SERVICES
+
+    guard = cfg.compatibility_guard()
+    command = getattr(args, "compat_command", None) or "status"
+
+    if command == "devices":
+        print("Device profiles. Add the ones on your network to wifiguard.toml:\n")
+        print('  [compatibility]')
+        print('  devices = ["apple", "smart-tv", "console"]      # or ["all"]\n')
+        for profile in DEVICE_PROFILES:
+            active = "on " if (profile.key in guard.profiles or "all" in guard.profiles) else "   "
+            print(f"  [{active}] {profile.key:<16} {profile.title}")
+            print(f"         {profile.note}")
+            print(f"         {len(profile.domains)} domains\n")
+        return 0
+
+    if command == "check":
+        name = args.domain.strip().lower().strip(".")
+        service = guard.explain(name)
+        if service is not None:
+            print(f"{name}: PROTECTED -- {service.title}")
+            print()
+            for line in _wrap(service.why, 74):
+                print(f"  {line}")
+            print()
+            print("  It is allowed ahead of every blocklist, category and group rule.")
+            print(f"  To stop protecting it: compatibility.unprotect = [\"{service.key}\"]")
+            return 0
+
+        hit = guard.match(name)
+        if hit:
+            print(f"{name}: allowed for compatibility ({hit.source})")
+            print(f"  matched {hit.rule}")
+            return 0
+
+        print(f"{name}: not treated as essential.")
+        print("  It is filtered by the normal rules -- `wifiguard check` says how.")
+        return 0
+
+    if command == "scan":
+        return _compat_scan(cfg, guard, args.limit)
+
+    # status
+    summary = guard.summary()
+    if not summary["enabled"]:
+        print("Compatibility protection is OFF.")
+        print("Blocklists can take away a device's clock or certificate checks,")
+        print("which breaks it in ways that are very hard to diagnose.")
+        return 0
+
+    print(f"Protecting {summary['rules']} domains that devices break without.\n")
+    print("  Essential services")
+    for service in ESSENTIAL_SERVICES:
+        state = "on " if service.key not in cfg.compatibility.unprotect else "OFF"
+        print(f"    [{state}] {service.key:<20} {len(service.domains):>3} domains  {service.title}")
+
+    active = [p for p in DEVICE_PROFILES if p.key in guard.profiles or "all" in guard.profiles]
+    print(f"\n  Device profiles ({len(active)} of {len(DEVICE_PROFILES)} active)")
+    if not active:
+        print("    none -- run `wifiguard compat devices` to see what is available")
+    for profile in active:
+        print(f"    [on ] {profile.key:<20} {len(profile.domains):>3} domains  {profile.title}")
+
+    print(f"\n  DNSSEC pass-through: {'on' if cfg.compatibility.dnssec_passthrough else 'OFF'}")
+    if not cfg.compatibility.dnssec_passthrough:
+        print("    A device that validates DNSSEC itself cannot resolve anything.")
+    return 0
+
+
+def _compat_scan(cfg: Config, guard, limit: int) -> int:
+    """Look through recent blocks for things that look like they break a device."""
+    url = f"http://{_dashboard_host(cfg)}:{cfg.dashboard.port}/api/queries?limit={limit}&action=block"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            queries = json.loads(response.read()).get("queries", [])
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        print(f"WiFiGuard does not appear to be running ({exc}).", file=sys.stderr)
+        print("The scan reads the live query log, so start it first.", file=sys.stderr)
+        return 1
+
+    # Words that show up in the names of services devices depend on. This is a
+    # hint for a human to look at, not a rule -- which is why it prints
+    # suspicions rather than allowing anything by itself.
+    signals = {
+        "time": ("ntp", "time.", "clock", "sntp"),
+        "certificates": ("ocsp", "crl.", "pki.", "cert"),
+        "connectivity": ("connectivity", "captive", "detectportal", "ncsi", "connecttest"),
+        "updates": ("update", "firmware", "swcdn", "swscan"),
+        "push": ("push", "mtalk", "notify", "courier"),
+    }
+
+    from collections import Counter
+
+    suspects: dict[str, Counter] = {key: Counter() for key in signals}
+    by_client: dict[str, Counter] = {}
+
+    for entry in queries:
+        name = str(entry.get("name", ""))
+        if not name:
+            continue
+        for key, words in signals.items():
+            if any(word in name for word in words):
+                suspects[key][name] += 1
+                by_client.setdefault(str(entry.get("client", "")), Counter())[name] += 1
+
+    flagged = {key: counter for key, counter in suspects.items() if counter}
+    if not flagged:
+        print(f"Looked at {len(queries)} recent blocks. Nothing looks likely to break a device.")
+        return 0
+
+    print(f"Looked at {len(queries)} recent blocks. These may be breaking something:\n")
+    for key, counter in flagged.items():
+        print(f"  {key}")
+        for name, count in counter.most_common(8):
+            protected = " (already protected)" if guard.match(name) else ""
+            print(f"    {name:<44} blocked {count}x{protected}")
+        print()
+
+    print("If a device on this network misbehaves, allow the matching name:")
+    example = next(iter(next(iter(flagged.values())).most_common(1)))[0]
+    print(f"  wifiguard allow {example}")
+    print("\nOr add the device's profile, which covers the whole class at once:")
+    print("  wifiguard compat devices")
+    return 0
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    import textwrap
+
+    return textwrap.wrap(" ".join(text.split()), width)
+
+
 def command_cluster(args: argparse.Namespace, cfg: Config) -> int:
     if args.cluster_command == "secret":
         import secrets
@@ -730,6 +876,7 @@ COMMANDS = {
     "vpn": command_vpn,
     "gateway": command_gateway,
     "cluster": command_cluster,
+    "compat": command_compat,
     "tls": command_tls,
     "init-config": command_init_config,
 }

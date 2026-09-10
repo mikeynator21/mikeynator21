@@ -40,6 +40,11 @@ min_ttl = 300
 max_entries = 200000
 prefetch_after = 0.9
 
+[compatibility]
+# The device classes actually on this network. Each adds the minimum that class
+# needs to work -- not its telemetry, which stays blocked.
+devices = ["apple", "android", "smart-tv", "console", "smart-home"]
+
 [vpn]
 enabled = true
 endpoint = "home.example.com"     # a dynamic-DNS name is fine

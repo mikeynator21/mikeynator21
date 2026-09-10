@@ -24,6 +24,7 @@ from ..config import Config
 from . import firewall, interfaces, networks
 from .dhcp import DHCPConfig, DHCPServer
 from .hotspot import Hotspot, HotspotConfig, pick_channel
+from .timeserver import TimeServer
 
 log = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ class GatewayManager:
         self.state = GatewayState()
         self.hotspot: Hotspot | None = None
         self.dhcp: DHCPServer | None = None
+        self.time_server: TimeServer | None = None
         self._watcher: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.RLock()
@@ -168,9 +170,20 @@ class GatewayManager:
                 dns_servers=self._resolver_list(router_address),
                 lease_seconds=settings.lease_seconds,
                 lease_file=self.config.lease_file,
+                # Clients are pointed at us for time. A device that cannot set
+                # its clock rejects every certificate it is shown, and cheap
+                # hardware with no battery-backed clock is in that state after
+                # every power cut.
+                ntp_servers=[router_address] if settings.serve_time else [],
+                mtu=self._client_mtu(),
+                static_routes=self._client_routes(router_address),
             )
         )
         self.dhcp.start()
+
+        if settings.serve_time:
+            self.time_server = TimeServer(router_address, interface=ap_interface)
+            self.time_server.start()
 
         firewall.enable_forwarding(ipv6=settings.allow_ipv6)
         self._apply_rules(uplink)
@@ -209,6 +222,9 @@ class GatewayManager:
         if self._watcher is not None:
             self._watcher.join(timeout=UPLINK_POLL_SECONDS + 2)
             self._watcher = None
+        if self.time_server is not None:
+            self.time_server.stop()
+            self.time_server = None
         if self.dhcp is not None:
             self.dhcp.stop()
             self.dhcp = None
@@ -254,6 +270,25 @@ class GatewayManager:
             self.state.uplink_fingerprint = interfaces.uplink_fingerprint()
             self.state.rules_applied = True
             self.state.vpn_interface = vpn_interface or ""
+
+    def _client_mtu(self) -> int:
+        """The MTU to advertise to clients.
+
+        With traffic leaving through a tunnel, a client sending full-size
+        packets forces fragmentation, and some paths drop the fragments
+        silently -- which looks like "big pages never load" rather than
+        anything to do with MTU.
+        """
+        if self.config.hotspot.route_through_vpn:
+            return 1420
+        return 0  # Say nothing, and let the client use the link default.
+
+    def _client_routes(self, router_address: str) -> list[tuple[str, str]]:
+        """Other subnets behind this router that clients should be able to reach."""
+        routes = []
+        for network in self.config.networks.extra_networks:
+            routes.append((network, router_address))
+        return routes
 
     @staticmethod
     def _uplink_subnet(uplink: str) -> str:
@@ -338,6 +373,7 @@ class GatewayManager:
         payload["associated"] = self.hotspot.clients() if self.hotspot else []
         payload["forwarding_enabled"] = firewall.forwarding_enabled()
         payload["ssid"] = self.config.hotspot.ssid
+        payload["time_server"] = self.time_server.status() if self.time_server else {"running": False}
         return payload
 
     def describe_rules(self) -> str:

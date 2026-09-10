@@ -21,6 +21,7 @@ from pathlib import Path
 from . import dnsmsg
 from .blocklist import BlocklistManager
 from .cache import CacheConfig, DNSCache
+from .compat import CompatibilityGuard
 from .config import Config
 from .engine import EngineConfig, FilterEngine
 from .policy import Device, Group, PolicyEngine, Schedule
@@ -163,7 +164,9 @@ def build_test_stack(state_dir: Path, upstream: StubUpstream, port: int):
     )
     blocklists.load(
         [str(rules)],
-        extra_block=["telemetry.example.com"],
+        # pool.ntp.org is blocked deliberately: the compatibility guard has to
+        # override it, or a device with no clock is dead on this network.
+        extra_block=["telemetry.example.com", "pool.ntp.org"],
         extra_allow=["allowed.ads.example.com"],
     )
 
@@ -201,6 +204,7 @@ def build_test_stack(state_dir: Path, upstream: StubUpstream, port: int):
     engine = FilterEngine(
         blocklists, policy, upstreams, cache, query_log,
         EngineConfig(block_mode="zero", rebinding_protection=True),
+        compat=CompatibilityGuard(profiles=["console"]),
     )
     server = DNSServer(
         engine,
@@ -239,6 +243,8 @@ def run_selftest(cfg: Config, port: int = 15353, keep: bool = False) -> int:
         _check_policy(report, engine, port)
         _check_protection(report, port, engine)
         _check_transport(report, port)
+        _check_compatibility(report, engine)
+        _check_time_server(report)
         _check_vpn(report, state_dir)
         _check_gateway(report)
 
@@ -481,6 +487,87 @@ def _check_transport(report: Report, port: int) -> None:
         except socket.timeout:
             reachable = False
     report.check("loopback clients are served", reachable)
+
+
+def _check_compatibility(report: Report, engine: FilterEngine) -> None:
+    """The services a device breaks without must outrank every block rule."""
+    from .compat import DEVICE_PROFILES, ESSENTIAL_SERVICES
+
+    result = engine.check("pool.ntp.org")
+    report.check(
+        "a blocklist cannot take away a device's clock",
+        result["action"] == "allow" and result.get("essential") == "time",
+        "pool.ntp.org is in this test's blocklist and still resolves",
+    )
+
+    for name, key in (
+        ("ocsp.digicert.com", "certificates"),
+        ("connectivitycheck.gstatic.com", "connectivity"),
+        ("courier.push.apple.com", "push"),
+    ):
+        outcome = engine.check(name)
+        report.check(
+            f"{key} kept working",
+            outcome["action"] == "allow" and outcome.get("essential") == key,
+            name,
+        )
+
+    report.check(
+        "ordinary blocking is unaffected",
+        engine.check("ads.example.com")["action"] == "block",
+    )
+
+    report.check(
+        "device profiles are opt-in",
+        engine.check("playstation.net")["action"] == "allow"
+        and engine.compat.match("meethue.com").matched is False,
+        "console profile is on for this test, smart-home is not",
+    )
+
+    report.check(
+        "every essential service explains itself",
+        all(service.why.strip() and service.domains for service in ESSENTIAL_SERVICES),
+        f"{len(ESSENTIAL_SERVICES)} services, {len(DEVICE_PROFILES)} device profiles",
+    )
+
+    # A validating client must get signatures, or it cannot resolve at all.
+    from .resolver import _build_upstream_query
+
+    signed = _build_upstream_query("example.com", dnsmsg.TYPE_A, 1, want_dnssec=True)
+    plain = _build_upstream_query("example.com", dnsmsg.TYPE_A, 1)
+    report.check(
+        "a client's DNSSEC request is carried upstream",
+        dnsmsg.wants_dnssec(signed) and not dnsmsg.wants_dnssec(plain),
+        "and is not requested otherwise, which keeps answers small",
+    )
+
+
+def _check_time_server(report: Report) -> None:
+    """A device with no battery-backed clock has to get the time somewhere."""
+    import struct as _struct
+    import time as _time
+
+    from .gateway.timeserver import MODE_CLIENT, TimeServer, from_ntp_timestamp
+
+    server = TimeServer("127.0.0.1")
+    request = bytearray(48)
+    request[0] = (4 << 3) | MODE_CLIENT
+    reply = server.build_reply(bytes(request), _time.time())
+
+    report.check("time server answers a client", reply is not None and len(reply) == 48)
+    if reply:
+        report.check("time server replies in server mode", reply[0] & 0x07 == 4)
+        report.check(
+            "the time it gives is right",
+            abs(from_ntp_timestamp(reply[40:48]) - _time.time()) < 2,
+        )
+
+    # Modes 6 and 7 are the classic NTP amplification vectors.
+    refused = all(
+        server.build_reply(bytes([(4 << 3) | mode]) + bytes(47), _time.time()) is None
+        for mode in (6, 7)
+    )
+    report.check("time server refuses amplification modes", refused, "modes 6 and 7")
 
 
 def _check_vpn(report: Report, state_dir: Path) -> None:

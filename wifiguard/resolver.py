@@ -427,11 +427,21 @@ class UpstreamPool:
         healthy.sort(key=lambda u: u.health.latency_ms or -1.0)
         return healthy + benched
 
-    def resolve(self, name: str, qtype: int, qclass: int = dnsmsg.CLASS_IN) -> bytes:
+    def resolve(
+        self,
+        name: str,
+        qtype: int,
+        qclass: int = dnsmsg.CLASS_IN,
+        *,
+        want_dnssec: bool = False,
+        checking_disabled: bool = False,
+    ) -> bytes:
         """Resolve one question, returning the raw response.
 
         The query is built here rather than forwarded, so it carries no EDNS
-        Client Subnet, no DNSSEC OK bit and a normalised question.
+        Client Subnet and a normalised question. The client's DNSSEC intent is
+        the one thing carried through, because a validating client cannot work
+        without it.
         """
         errors: list[str] = []
 
@@ -442,7 +452,10 @@ class UpstreamPool:
                 wire_name = apply_0x20(name)
 
             try:
-                query = _build_upstream_query(wire_name, qtype, qclass)
+                query = _build_upstream_query(
+                    wire_name, qtype, qclass,
+                    want_dnssec=want_dnssec, checking_disabled=checking_disabled,
+                )
             except ValueError as exc:
                 raise ResolutionError(f"cannot encode {name!r}: {exc}") from exc
 
@@ -478,14 +491,34 @@ class UpstreamPool:
         ]
 
 
-def _build_upstream_query(name: str, qtype: int, qclass: int) -> bytes:
-    flags = 0x0100  # RD, and deliberately not CD: upstream should validate.
+def _build_upstream_query(
+    name: str,
+    qtype: int,
+    qclass: int,
+    *,
+    want_dnssec: bool = False,
+    checking_disabled: bool = False,
+) -> bytes:
+    """Build the query we send upstream.
+
+    By default no DNSSEC records are requested: the upstream resolver validates
+    and we read its AD bit, which is the same guarantee for a fraction of the
+    bytes. But a client that says it will validate for itself must get the
+    signatures, or it fails every lookup -- so its DO and CD bits are carried
+    through rather than dropped.
+    """
+    flags = 0x0100  # RD
+    if checking_disabled:
+        flags |= 0x0010  # CD: the client is doing its own validation.
     out = bytearray(struct.pack("!6H", 0, flags, 1, 0, 0, 1))
     out += dnsmsg.encode_name(name)
     out += struct.pack("!HH", qtype, qclass)
     # EDNS0 with a 1232-byte buffer: large enough to avoid TCP fallback for
     # almost every answer, small enough to never trigger IP fragmentation.
-    out += struct.pack("!BHHIH", 0, dnsmsg.TYPE_OPT, dnsmsg.SAFE_UDP_PAYLOAD, 0, 0)
+    # Signed answers are bigger, so allow more room when they were asked for.
+    payload = 4096 if want_dnssec else dnsmsg.SAFE_UDP_PAYLOAD
+    ttl = dnsmsg.EDNS_DO_BIT if want_dnssec else 0
+    out += struct.pack("!BHHIH", 0, dnsmsg.TYPE_OPT, payload, ttl, 0)
     return bytes(out)
 
 

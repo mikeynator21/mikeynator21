@@ -68,6 +68,8 @@ class Application:
             log_queries=config.logging.log_queries,
         )
 
+        self.compat = config.compatibility_guard()
+        config.engine.dnssec_passthrough = config.compatibility.dnssec_passthrough
         self.engine = FilterEngine(
             self.blocklists,
             self.policy,
@@ -75,6 +77,7 @@ class Application:
             self.cache,
             self.query_log,
             config.engine,
+            compat=self.compat,
         )
         self.dns = DNSServer(self.engine, config.server)
 
@@ -313,6 +316,7 @@ class Application:
             },
             "groups": sorted(self.config.groups),
             "networks": self.network_summary(),
+            "compatibility": self.compat.summary(),
         }
         if self.config.cluster.enabled:
             payload["cluster"] = self.cluster.status()

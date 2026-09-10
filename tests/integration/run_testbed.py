@@ -159,7 +159,12 @@ min_ttl = 300
 
 [blocklists]
 sources = []
-block = ["ads.example.com", "tracker.example.net", "*.doubleclick-test.net"]
+# Deliberately blocked, to prove the compatibility guard overrides even an
+# explicit block: a device with no clock and no certificate checks is dead.
+block = [
+    "ads.example.com", "tracker.example.net", "*.doubleclick-test.net",
+    "pool.ntp.org", "ocsp.digicert.com", "connectivitycheck.gstatic.com",
+]
 allow = ["allowed.ads.example.com"]
 block_doh_bypass = true
 
@@ -507,6 +512,98 @@ def scenario_encrypted_upstream(report: Report, testbed: Testbed) -> None:
     testbed.env.pop("SSL_CERT_FILE", None)
 
 
+def scenario_device_compatibility(report: Report, testbed: Testbed) -> None:
+    report.heading("Devices that would otherwise be broken by filtering")
+
+    # These three are in the testbed's blocklist above. A device losing any of
+    # them breaks in a way that gives no clue the network is responsible.
+    for name, expected, what in (
+        ("pool.ntp.org", "162.159.200.1", "clock"),
+        ("ocsp.digicert.com", "93.184.216.46", "certificate checks"),
+        ("connectivitycheck.gstatic.com", "93.184.216.47", "connectivity probe"),
+    ):
+        resolved = dig(topo.PHONE, topo.AP_ADDR, name)
+        report.check(
+            f"blocklist cannot take away a device's {what}",
+            resolved == expected,
+            f"{name} -> {resolved!r} (explicitly blocked in this config)",
+        )
+
+    # ...while ordinary blocking is unaffected.
+    still_blocked = dig(topo.PHONE, topo.AP_ADDR, "ads.example.com")
+    report.check("ordinary names are still blocked", still_blocked == "0.0.0.0",
+                 f"got {still_blocked!r}")
+
+    # A device that validates DNSSEC itself must get the signatures, or every
+    # lookup it makes fails.
+    before = upstream_counters()
+    sh(topo.PHONE, "dig", f"@{topo.AP_ADDR}", "signed.example.com", "+dnssec",
+       "+timeout=3", "+tries=1")
+    after = upstream_counters()
+    report.check(
+        "a client's DNSSEC request is carried upstream",
+        after.get("dnssec_requests", 0) > before.get("dnssec_requests", 0),
+        f"upstream saw DO set for {after.get('dnssec_names', [])[-1:]}",
+    )
+
+    # And a plain client still gets the cheap unsigned path.
+    before = upstream_counters()
+    dig(topo.PHONE, topo.AP_ADDR, "burst.example.com")
+    after = upstream_counters()
+    report.check(
+        "a plain client is not charged for signatures",
+        after.get("dnssec_requests", 0) == before.get("dnssec_requests", 0),
+        "DNSSEC records are only fetched when a client asks for them",
+    )
+
+
+def scenario_clockless_device(report: Report, testbed: Testbed) -> None:
+    report.heading("A device with no clock")
+
+    # Ask for a lease again, this time reading the options a device that needs
+    # a clock would act on. Runs on the client segment, which is where the DHCP
+    # server listens.
+    result = sh(topo.PHONE, "python3", str(HERE / "dhcp_probe.py"), timeout=30)
+    try:
+        lease = json.loads(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        report.check("device received DHCP options", False,
+                     (result.stdout + result.stderr).strip()[:150])
+        return
+    if "error" in lease:
+        report.check("device received DHCP options", False, lease["error"])
+        return
+
+    report.check("lease includes an NTP server", bool(lease.get("ntp")),
+                 f"NTP = {lease.get('ntp')}")
+    report.check("the NTP server is the gateway itself",
+                 lease.get("ntp") == [topo.AP_ADDR],
+                 "an address, because DHCP cannot carry a name like pool.ntp.org")
+    report.check("lease includes an MTU", lease.get("mtu", 0) > 0,
+                 f"MTU = {lease.get('mtu')}")
+    report.check("lease includes a domain search list",
+                 bool(lease.get("domain_search")),
+                 f"search = {lease.get('domain_search')!r}")
+
+    # Now actually ask the gateway for the time, as the device would.
+    result = sh(topo.PHONE, "python3", str(HERE / "ntp_probe.py"), topo.AP_ADDR, timeout=20)
+    try:
+        answer = json.loads(result.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        report.check("gateway answered an NTP request", False,
+                     (result.stdout + result.stderr).strip()[:150])
+        return
+
+    report.check("gateway answered an NTP request", answer.get("ok", False),
+                 answer.get("error", ""))
+    if answer.get("ok"):
+        report.check("the time it gave is correct",
+                     abs(answer["offset"]) < 5,
+                     f"{answer['offset']:+.3f}s from this host's clock")
+        report.check("the reply is a server-mode NTP packet", answer["mode"] == 4,
+                     f"mode {answer['mode']}, stratum {answer['stratum']}")
+
+
 def scenario_uplink_change(report: Report, testbed: Testbed) -> None:
     report.heading("The uplink moves (as it does on a laptop)")
 
@@ -571,6 +668,8 @@ def main() -> int:
         scenario_bypass(report)
         scenario_routing(report)
         scenario_multi_network(report)
+        scenario_device_compatibility(report, testbed)
+        scenario_clockless_device(report, testbed)
         scenario_encrypted_upstream(report, testbed)
         scenario_uplink_change(report, testbed)
 

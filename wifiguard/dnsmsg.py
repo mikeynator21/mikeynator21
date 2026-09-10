@@ -315,6 +315,36 @@ def _edns_payload_size(data: bytes) -> int | None:
     return None
 
 
+#: In an OPT record the 32-bit "TTL" field carries extended rcode, version and
+#: flags. The top flag bit is DO -- "DNSSEC OK" -- by which a client says it
+#: wants signatures and intends to validate them itself.
+EDNS_DO_BIT = 0x8000
+
+
+def wants_dnssec(data: bytes) -> bool:
+    """Whether the client set the DNSSEC OK bit.
+
+    A validating client that asks for signatures and is handed an unsigned
+    answer treats it as an attack and fails the lookup, so this has to be
+    honoured rather than quietly dropped.
+    """
+    try:
+        for record in iter_records(data):
+            if record.rtype == TYPE_OPT:
+                return bool(record.ttl & EDNS_DO_BIT)
+    except DNSFormatError:
+        return False
+    return False
+
+
+def checking_disabled(data: bytes) -> bool:
+    """Whether the client set CD, meaning it will validate for itself."""
+    try:
+        return bool(parse_header(data).flags & 0x0010)
+    except DNSFormatError:
+        return False
+
+
 def _opt_record(payload_size: int) -> bytes:
     # Root name, type OPT, class = payload size, extended rcode/version/flags 0,
     # no options.  The DO bit is deliberately cleared: we do not sign answers.

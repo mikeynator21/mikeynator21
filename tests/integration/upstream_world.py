@@ -47,6 +47,12 @@ ZONE = {
     "pin-ok.example.com": "93.184.216.41",
     "pin-bad.example.com": "93.184.216.42",
     "uplink-probe.example.com": "93.184.216.43",
+    "signed.example.com": "93.184.216.44",
+    # A name devices depend on, deliberately also put in the testbed's
+    # blocklist so protection can be observed rather than assumed.
+    "pool.ntp.org": "162.159.200.１".replace("１", "1"),
+    "ocsp.digicert.com": "93.184.216.46",
+    "connectivitycheck.gstatic.com": "93.184.216.47",
 }
 
 
@@ -57,14 +63,19 @@ class Counters:
         self.doh = 0
         self.tcp_connections = 0
         self.names: list[str] = []
+        self.dnssec_requests = 0
+        self.dnssec_names: list[str] = []
 
-    def record(self, transport: str, name: str) -> None:
+    def record(self, transport: str, name: str, dnssec: bool = False) -> None:
         with self.lock:
             if transport == "udp":
                 self.udp += 1
             elif transport == "doh":
                 self.doh += 1
             self.names.append(name)
+            if dnssec:
+                self.dnssec_requests += 1
+                self.dnssec_names.append(name)
             self._write()
 
     def record_tcp(self) -> None:
@@ -81,6 +92,8 @@ class Counters:
                     "total_dns": self.udp + self.doh,
                     "tcp_connections": self.tcp_connections,
                     "names": self.names[-200:],
+                    "dnssec_requests": self.dnssec_requests,
+                    "dnssec_names": self.dnssec_names[-50:],
                 }
             )
         )
@@ -97,7 +110,8 @@ def answer(query: bytes, transport: str) -> bytes | None:
     if question is None:
         return None
 
-    COUNTERS.record(transport, question.name)
+    # Whether the resolver passed the client's DNSSEC request through.
+    COUNTERS.record(transport, question.name, dnsmsg.wants_dnssec(query))
 
     address = ZONE.get(question.name)
     if question.qtype == dnsmsg.TYPE_A and address:
