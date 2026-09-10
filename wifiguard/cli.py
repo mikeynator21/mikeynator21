@@ -184,6 +184,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def command_run(args: argparse.Namespace, cfg: Config) -> int:
+    if cfg.source_path is None:
+        # Defaults bind to localhost only, so a first run without a config
+        # filters this machine and nothing else -- which is rarely what
+        # someone starting the service intended, and gives no clue why.
+        print(
+            "No configuration file found, so WiFiGuard is running with defaults:\n"
+            "  filtering for this machine only, on 127.0.0.1.\n\n"
+            "To cover the rest of your network, stop this and run:\n"
+            "  sudo wifiguard setup\n",
+            file=sys.stderr,
+        )
+
     if args.update:
         cfg.blocklists.update_on_start = True
 

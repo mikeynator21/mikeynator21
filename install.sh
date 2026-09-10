@@ -91,12 +91,23 @@ chmod +x "$BINDIR/wifiguard"
 mkdir -p "$CONFDIR" "$STATEDIR"
 chmod 700 "$STATEDIR"
 
-if [[ ! -f "$CONFDIR/wifiguard.toml" ]]; then
-    info "writing a starter config to $CONFDIR/wifiguard.toml"
+if [[ -f "$CONFDIR/wifiguard.toml" ]]; then
+    info "keeping the existing $CONFDIR/wifiguard.toml"
+elif [[ -t 0 ]]; then
+    # Interactive: ask the four questions rather than leaving a reference file
+    # for someone to work through.
+    info "let's configure it"
+    echo
+    "$BINDIR/wifiguard" setup --out "$CONFDIR/wifiguard.toml" || {
+        warn "setup did not finish; writing a starter config instead"
+        "$BINDIR/wifiguard" init-config > "$CONFDIR/wifiguard.toml"
+        chmod 600 "$CONFDIR/wifiguard.toml"
+    }
+else
+    info "no terminal, so writing a commented starter config"
     "$BINDIR/wifiguard" init-config > "$CONFDIR/wifiguard.toml"
     chmod 600 "$CONFDIR/wifiguard.toml"
-else
-    info "keeping the existing $CONFDIR/wifiguard.toml"
+    RAN_SETUP=no
 fi
 
 # --- service ------------------------------------------------------------------
@@ -114,14 +125,27 @@ else
     warn "the self-test reported problems; see /tmp/wifiguard-selftest.log"
 fi
 
+if [[ "${RAN_SETUP:-yes}" == "no" ]]; then
 cat <<'NEXT'
 
-WiFiGuard is installed.
+WiFiGuard is installed, but not configured.
 
-  wifiguard doctor      check this machine is ready
-  wifiguard selftest    verify the filtering works (no root needed)
+  sudo wifiguard setup      four questions, then a working config
 
-To start filtering for this machine only:
+Or edit /etc/wifiguard/wifiguard.toml by hand -- every setting in it is
+commented.
+NEXT
+else
+cat <<'NEXT'
+
+WiFiGuard is installed and configured.
+
+  wifiguard doctor      is this machine ready?
+  wifiguard fieldtest   what is this network doing to my DNS?
+  wifiguard selftest    does the filtering work? (no root needed)
+  wifiguard harden      any weak settings?
+
+Then start it:
   sudo systemctl enable --now wifiguard
 
 Port 53 is usually held by systemd-resolved. If `doctor` says so:
@@ -129,10 +153,7 @@ Port 53 is usually held by systemd-resolved. If `doctor` says so:
   sudo rm -f /etc/resolv.conf
   echo 'nameserver 127.0.0.1' | sudo tee /etc/resolv.conf
 
-To cover every device on your network, point your router's DHCP
-"DNS server" setting at this machine's address.
-
-To share this machine's connection as a filtered hotspot, or to reach
-the filter from your phone anywhere, see docs/laptop-gateway.md and
+For the laptop hotspot or your phone, see docs/laptop-gateway.md and
 docs/phone.md.
 NEXT
+fi
