@@ -11,7 +11,9 @@ a readable dashboard possible -- otherwise every device is just a MAC address.
 
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
+import itertools
 import json
 import logging
 import socket
@@ -206,7 +208,13 @@ class DHCPServer:
             return None, None
 
         options = request["options"]
-        message_type = options.get(OPT_MESSAGE_TYPE, b"\x00")[0]
+        # An option truncated by the sender parses to an empty value, so this
+        # cannot index blindly: `get` returns b"" rather than the default, and
+        # one malformed packet would otherwise log a traceback per copy.
+        raw_type = options.get(OPT_MESSAGE_TYPE) or b""
+        if not raw_type:
+            return None, None
+        message_type = raw_type[0]
         # RFC 2131: a client that sends a client identifier expects its lease to
         # be keyed by that rather than by its hardware address. Windows and
         # several embedded stacks rely on it.
@@ -227,9 +235,15 @@ class DHCPServer:
             requested = options.get(OPT_REQUESTED_IP)
             server_id = options.get(OPT_SERVER_ID)
             if server_id and _ip_from_bytes(server_id) != self.config.server_ip:
-                # The client picked a different server's offer.
+                # The client picked a different server's offer, so drop ours.
+                # Only if the lease really is this client's, though: the key
+                # comes from a client identifier the sender chooses, so without
+                # the check anyone on the hotspot could release someone else's
+                # address by naming it and letting it be handed out again.
                 with self._lock:
-                    self.leases.pop(key, None)
+                    held = self.leases.get(key)
+                    if held is not None and held.mac == mac:
+                        del self.leases[key]
                 return None, None
 
             lease = self._allocate(key, mac, hostname, vendor, requested)
@@ -322,8 +336,13 @@ class DHCPServer:
         return lease
 
     def _pool(self) -> list[str]:
-        hosts = list(self.config.subnet.hosts())
-        return [str(ip) for ip in hosts[self.config.first_offset : self.config.last_offset]]
+        # Sliced off the generator rather than a materialised list: `hosts()` on
+        # a /16 is 65534 addresses and on a /8 is nearly 17 million, and this
+        # runs inside the lock on every allocation.
+        window = itertools.islice(
+            self.config.subnet.hosts(), self.config.first_offset, self.config.last_offset
+        )
+        return [str(ip) for ip in window]
 
     def _in_pool(self, address: str) -> bool:
         try:
@@ -475,9 +494,23 @@ class DHCPServer:
         except (OSError, ValueError) as exc:
             log.warning("could not read DHCP leases: %s", exc)
             return
+        if not isinstance(payload, dict):
+            log.warning("ignoring DHCP lease file %s: not a lease table", path)
+            return
+        fields = {field.name for field in dataclasses.fields(Lease)}
         with self._lock:
-            for mac, entry in payload.items():
-                self.leases[mac] = Lease(**entry)
+            for key, entry in payload.items():
+                # Leases are a convenience, never a requirement: anything the
+                # file gets wrong is dropped rather than allowed to stop the
+                # gateway from starting at all.
+                if not isinstance(key, str) or not isinstance(entry, dict):
+                    continue
+                try:
+                    self.leases[key] = Lease(**{
+                        name: value for name, value in entry.items() if name in fields
+                    })
+                except TypeError as exc:
+                    log.warning("ignoring an unreadable DHCP lease for %s: %s", key, exc)
         log.info("restored %d DHCP leases", len(self.leases))
 
     def _save_leases(self) -> None:

@@ -108,6 +108,13 @@ private networks are ignored entirely — not refused, ignored, because replying
 at all confirms the port is open. Per-client token-bucket rate limiting is on
 by default.
 
+**The joined network reaching back in.** Every port WiFiGuard opens — the
+resolver, the dashboard, DHCP, the time server, the cluster listener — is
+dropped on the uplink interface. Only WiFiGuard's own ports are named, so
+whatever else the machine runs (ssh, say) keeps working; the point is that
+nothing *we* opened answers the hotel LAN. Clients on the hotspot reach the
+internet through that network without reaching the hosts on it.
+
 **Resource exhaustion by a device on your own network.** A DNS-over-TCP
 connection stays open between queries, so TCP has its own workers and its own
 ceiling — in total and per client. Without that, a handful of connections

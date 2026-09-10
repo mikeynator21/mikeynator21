@@ -271,6 +271,12 @@ class GatewayManager:
             isolate_from_uplink=settings.isolate_from_uplink,
             uplink_subnet=self._uplink_subnet(uplink),
             shared_networks=self._shared_networks(uplink),
+            # The cluster listener binds every address, so without naming it
+            # here it would answer the network the laptop joined. It is
+            # authenticated, but an open port on a hotel LAN is still a port.
+            local_udp_ports=(
+                [self.config.cluster.port] if self.config.cluster.enabled else []
+            ),
         )
         firewall.apply_rules(rules)
 

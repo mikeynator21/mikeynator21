@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -55,8 +56,38 @@ DOH_ENDPOINT_ADDRESSES_V6 = [
 ]
 
 
+#: A Linux interface name: at most 15 characters, and none of the ones that
+#: would end a token in the ruleset we render.
+_INTERFACE_NAME = re.compile(r"^[A-Za-z0-9_.@:-]{1,15}$")
+
+
 class FirewallError(RuntimeError):
     """A firewall command failed."""
+
+
+def _check_interface(name: str, what: str) -> str:
+    """Reject an interface name that could not be one.
+
+    The ruleset is rendered as text and fed to `nft -f`, so a name carrying a
+    quote or a newline would not be a confusing error -- it would be extra
+    firewall rules. These names come from the config file and from interface
+    discovery, both of which should always produce something ordinary; that is
+    exactly why an unusual one is worth stopping at.
+    """
+    if not _INTERFACE_NAME.match(name or ""):
+        raise FirewallError(
+            f"{what} {name!r} is not a valid interface name. Run `ip link` to see "
+            f"the interfaces on this machine."
+        )
+    return name
+
+
+def _check_network(value: str, what: str) -> str:
+    """Reject anything that is not a plain CIDR network, for the same reason."""
+    try:
+        return str(ipaddress.ip_network(value, strict=False))
+    except ValueError as exc:
+        raise FirewallError(f"{what} {value!r} is not a network in CIDR form: {exc}") from exc
 
 
 @dataclass
@@ -89,6 +120,19 @@ class GatewayRules:
     #: the point of the gateway.
     allow_ipv6: bool = False
     extra_allowed_ports: list[int] = field(default_factory=list)
+    #: Every other UDP port WiFiGuard binds -- the cluster listener, the time
+    #: server. They are dropped on the uplink alongside DNS and the dashboard:
+    #: the input chain accepts by default so as not to interfere with whatever
+    #: else the machine runs, which means each port we open we must also close
+    #: against the network we joined.
+    local_udp_ports: list[int] = field(default_factory=list)
+    local_tcp_ports: list[int] = field(default_factory=list)
+
+
+def _port_list(ports: list[int]) -> str:
+    """A deduplicated, sorted nftables port set. Anything unusable is dropped."""
+    valid = sorted({int(port) for port in ports if isinstance(port, int) and 0 < port < 65536})
+    return ", ".join(str(port) for port in valid)
 
 
 def nft_available() -> bool:
@@ -111,10 +155,12 @@ def _run(command: list[str], stdin: str | None = None, check: bool = True) -> st
 
 def build_ruleset(rules: GatewayRules) -> str:
     """Render the complete nftables ruleset for the current topology."""
-    ap = rules.ap_interface
+    ap = _check_interface(rules.ap_interface, "the access point interface")
+    _check_interface(rules.uplink_interface, "the uplink interface")
+    if rules.vpn_interface:
+        _check_interface(rules.vpn_interface, "the VPN interface")
     uplink = rules.vpn_interface or rules.uplink_interface
     subnet = str(rules.subnet)
-    router_ip = str(next(rules.subnet.hosts()))
 
     allowed_input_ports = [rules.dashboard_port, *rules.extra_allowed_ports]
     dashboard_rules = "\n".join(
@@ -140,17 +186,20 @@ def build_ruleset(rules: GatewayRules) -> str:
 
     isolation_rules = ""
     if rules.isolate_from_uplink and rules.uplink_subnet:
+        uplink_subnet = _check_network(rules.uplink_subnet, "the uplink subnet")
         isolation_rules = f"""
         # Clients reach the internet *through* the joined network, but not the
         # hosts sharing it. On a hotel or cafe LAN that segment is full of
         # strangers' machines, and this is the isolation that makes plugging in
         # safe. It must come before the accept below, which would match first.
-        iifname "{ap}" ip daddr {rules.uplink_subnet} drop
+        iifname "{ap}" ip daddr {uplink_subnet} drop
 """
 
     shared_rules = ""
     if len(rules.shared_networks) > 1:
-        members = ", ".join(rules.shared_networks)
+        members = ", ".join(
+            _check_network(network, "a shared network") for network in rules.shared_networks
+        )
         shared_rules = f"""
         # Networks allowed to reach one another, so discovery leads somewhere:
         # finding a printer or a TV is no use if the connection that follows is
@@ -158,6 +207,14 @@ def build_ruleset(rules: GatewayRules) -> str:
         # gateway joined is never opened up by this.
         ip saddr {{ {members} }} ip daddr {{ {members} }} accept
 """
+
+    # 67 is the DHCP server and 123 the time server; both are meant for our own
+    # clients only, and both are bound to the AP device already. Naming them
+    # here as well means the block holds even where that bind is unavailable.
+    uplink_udp_drop = _port_list([rules.dns_port, 67, 123, *rules.local_udp_ports])
+    uplink_tcp_drop = _port_list(
+        [rules.dns_port, rules.dashboard_port, *rules.extra_allowed_ports, *rules.local_tcp_ports]
+    )
 
     if rules.allow_ipv6:
         ipv6_forward = f'        iifname "{ap}" oifname "{uplink}" accept'
@@ -210,10 +267,12 @@ table inet {FILTER_TABLE} {{
         ip6 daddr {{ ff02::fb, ff02::c }} accept
 {dashboard_rules}
 
-        # The dashboard and resolver must never be reachable from the network
-        # the laptop has joined -- that network is untrusted.
-        iifname "{rules.uplink_interface}" tcp dport {{ {rules.dns_port}, {rules.dashboard_port} }} drop
-        iifname "{rules.uplink_interface}" udp dport {rules.dns_port} drop
+        # Nothing WiFiGuard opens may answer the network the laptop has
+        # joined -- that network is untrusted, and on a hotel or cafe LAN it is
+        # full of strangers. Only our own ports are named: the policy here is
+        # accept so that whatever else this machine runs keeps working.
+        iifname "{rules.uplink_interface}" tcp dport {{ {uplink_tcp_drop} }} drop
+        iifname "{rules.uplink_interface}" udp dport {{ {uplink_udp_drop} }} drop
     }}
 
     chain forward {{

@@ -6,12 +6,24 @@ import socket
 import struct
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 from wifiguard.cluster import Cluster, ClusterConfig, IdleMonitor, NodeState
 from wifiguard.gateway import firewall, hotspot, networks, reflector
-from wifiguard.gateway.dhcp import DHCPConfig, DHCPServer, parse_packet
+from wifiguard.gateway.dhcp import (
+    DISCOVER,
+    MAGIC_COOKIE,
+    OPT_CLIENT_ID,
+    OPT_END,
+    OPT_MESSAGE_TYPE,
+    OPT_SERVER_ID,
+    REQUEST,
+    DHCPConfig,
+    DHCPServer,
+    parse_packet,
+)
 from wifiguard.server import RateLimiter
 
 SUBNET = ipaddress.ip_network("10.42.7.0/24")
@@ -114,7 +126,77 @@ class FirewallRuleTests(unittest.TestCase):
         self.assertIn("type filter hook forward priority filter; policy drop;", self.rules())
 
     def test_resolver_not_exposed_to_the_joined_network(self):
-        self.assertIn('iifname "wlan0" udp dport 53 drop', self.rules())
+        text = self.rules()
+        self.assertIn('iifname "wlan0" udp dport { 53, 67, 123 } drop', text)
+        self.assertIn('iifname "wlan0" tcp dport { 53, 8080 } drop', text)
+
+    def test_every_port_we_open_is_closed_against_the_joined_network(self):
+        # The input chain accepts by default, so that whatever else the machine
+        # runs keeps working. That makes each port WiFiGuard opens one it must
+        # also close: the cluster listener binds 0.0.0.0 and would otherwise
+        # answer the hotel LAN.
+        text = self.rules(local_udp_ports=[51821])
+        self.assertIn('iifname "wlan0" udp dport { 53, 67, 123, 51821 } drop', text)
+
+    def test_dhcp_and_time_are_closed_against_the_joined_network(self):
+        # Both are bound to the AP device as well, but that bind can fail and
+        # only warns; the rule is what makes it hold either way.
+        text = self.rules()
+        self.assertIn("67", text.split("udp dport {")[-1].split("}")[0])
+        self.assertIn("123", text.split("udp dport {")[-1].split("}")[0])
+
+
+class RulesetInjectionTests(unittest.TestCase):
+    """The ruleset is rendered as text and handed to `nft -f`.
+
+    A name carrying a quote or a newline would not be a confusing error, it
+    would be extra firewall rules -- so anything that could not be an interface
+    name is refused before it is rendered.
+    """
+
+    def build(self, **overrides):
+        settings = dict(
+            ap_interface="wlan1",
+            uplink_interface="wlan0",
+            subnet=ipaddress.ip_network("10.42.7.0/24"),
+        )
+        settings.update(overrides)
+        return firewall.build_ruleset(firewall.GatewayRules(**settings))
+
+    def test_an_ordinary_ruleset_still_builds(self):
+        self.assertIn('iifname "wlan1"', self.build())
+
+    def test_a_quote_in_an_interface_name_is_refused(self):
+        with self.assertRaises(firewall.FirewallError):
+            self.build(ap_interface='wlan1" accept; iifname "x')
+
+    def test_a_newline_in_an_interface_name_is_refused(self):
+        with self.assertRaises(firewall.FirewallError):
+            self.build(uplink_interface="wlan0\n    accept")
+
+    def test_an_over_long_interface_name_is_refused(self):
+        with self.assertRaises(firewall.FirewallError):
+            self.build(ap_interface="w" * 16)
+
+    def test_an_empty_interface_name_is_refused(self):
+        with self.assertRaises(firewall.FirewallError):
+            self.build(ap_interface="")
+
+    def test_a_bad_vpn_interface_is_refused(self):
+        with self.assertRaises(firewall.FirewallError):
+            self.build(vpn_interface='wg0" drop; # ')
+
+    def test_a_bad_uplink_subnet_is_refused(self):
+        with self.assertRaises(firewall.FirewallError):
+            self.build(uplink_subnet="192.168.1.0/24 drop; # ")
+
+    def test_a_bad_shared_network_is_refused(self):
+        with self.assertRaises(firewall.FirewallError):
+            self.build(shared_networks=["10.0.0.0/24", "not-a-network"])
+
+    def test_ordinary_interface_names_are_accepted(self):
+        for name in ("eth0", "wlan0", "wg0", "br-lan", "enp0s31f6", "eno1.100"):
+            self.build(ap_interface=name)
 
 
 class RulesetSyntaxTests(unittest.TestCase):
@@ -156,6 +238,19 @@ class RulesetSyntaxTests(unittest.TestCase):
             firewall.build_ruleset(
                 firewall.GatewayRules(
                     ap_interface="wlan1", uplink_interface="wlan0", subnet=SUBNET
+                )
+            )
+        )
+
+    def test_ruleset_valid_with_every_local_port_closed(self):
+        # The port sets grow with whatever else WiFiGuard has bound, so nft
+        # itself has to agree the resulting rule is still well formed.
+        self._validate(
+            firewall.build_ruleset(
+                firewall.GatewayRules(
+                    ap_interface="wlan1", uplink_interface="wlan0", subnet=SUBNET,
+                    local_udp_ports=[51821], local_tcp_ports=[51820],
+                    extra_allowed_ports=[8443],
                 )
             )
         )
@@ -560,6 +655,191 @@ class NetworkDiscoveryTests(unittest.TestCase):
 
     def test_summarise_returns_text(self):
         self.assertIsInstance(networks.summarise(), str)
+
+
+def dhcp_packet(message_type=None, *, mac=b"\x02\x00\x00\x00\x00\x01", options=b"", op=1):
+    """A minimal but well-formed BOOTP request, for poking at the parser."""
+    packet = bytearray(240)
+    packet[0] = op
+    packet[1] = 1        # ethernet
+    packet[2] = 6        # hardware address length
+    packet[4:8] = b"\xde\xad\xbe\xef"
+    packet[28 : 28 + len(mac)] = mac
+    packet[236:240] = MAGIC_COOKIE
+    if message_type is not None:
+        packet += bytes([OPT_MESSAGE_TYPE, 1, message_type])
+    packet += options
+    packet += bytes([OPT_END])
+    return bytes(packet)
+
+
+class DHCPMalformedPacketTests(unittest.TestCase):
+    """Anything on the hotspot can send these, so none of them may raise."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.server = DHCPServer(
+            DHCPConfig(
+                interface="wlan1",
+                subnet=ipaddress.ip_network("10.42.7.0/24"),
+                server_ip="10.42.7.1",
+                lease_file=Path(self.tmp.name) / "leases.json",
+            )
+        )
+
+    def test_a_truncated_message_type_is_ignored(self):
+        # The sender says one byte follows and then ends the packet. The option
+        # parses to an empty value, which `get` returns in place of the default.
+        packet = bytearray(240)
+        packet[0] = 1
+        packet[236:240] = MAGIC_COOKIE
+        packet += bytes([OPT_MESSAGE_TYPE, 1])
+        self.assertEqual(self.server.handle(bytes(packet)), (None, None))
+
+    def test_a_packet_with_no_message_type_is_ignored(self):
+        self.assertEqual(self.server.handle(dhcp_packet()), (None, None))
+
+    def test_a_packet_that_is_all_padding_is_ignored(self):
+        packet = bytearray(240)
+        packet[0] = 1
+        packet[236:240] = MAGIC_COOKIE
+        packet += b"\x00" * 40
+        self.assertEqual(self.server.handle(bytes(packet)), (None, None))
+
+    def test_an_ordinary_discover_is_still_answered(self):
+        reply, destination = self.server.handle(dhcp_packet(DISCOVER))
+        self.assertIsNotNone(reply)
+        self.assertEqual(destination, ("255.255.255.255", 68))
+
+    def test_every_truncation_of_a_real_discover_is_survivable(self):
+        full = dhcp_packet(DISCOVER)
+        for length in range(len(full) + 1):
+            with self.subTest(length=length):
+                self.server.handle(full[:length])
+
+
+class DHCPLeaseFileTests(unittest.TestCase):
+    """Leases are a convenience. A damaged file must not stop the gateway."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "leases.json"
+
+    def build(self):
+        return DHCPServer(
+            DHCPConfig(
+                interface="wlan1",
+                subnet=ipaddress.ip_network("10.42.7.0/24"),
+                server_ip="10.42.7.1",
+                lease_file=self.path,
+            )
+        )
+
+    def test_a_lease_with_an_unknown_field_is_dropped(self):
+        self.path.write_text('{"aa:bb": {"ip": "10.42.7.5", "mac": "aa:bb", "wat": 1}}')
+        self.assertEqual(self.build().leases["aa:bb"].ip, "10.42.7.5")
+
+    def test_a_lease_missing_a_required_field_is_dropped(self):
+        self.path.write_text('{"aa:bb": {"hostname": "nope"}}')
+        self.assertEqual(self.build().leases, {})
+
+    def test_a_file_that_is_not_a_table_is_ignored(self):
+        self.path.write_text('["not", "a", "table"]')
+        self.assertEqual(self.build().leases, {})
+
+    def test_an_entry_that_is_not_an_object_is_ignored(self):
+        self.path.write_text('{"aa:bb": "not an object"}')
+        self.assertEqual(self.build().leases, {})
+
+    def test_a_good_file_still_loads(self):
+        self.path.write_text(
+            '{"aa:bb": {"ip": "10.42.7.5", "mac": "aa:bb", "hostname": "tv"}}'
+        )
+        self.assertEqual(self.build().leases["aa:bb"].hostname, "tv")
+
+
+class DHCPLeaseOwnershipTests(unittest.TestCase):
+    """A client identifier is chosen by the sender, so it proves nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.server = DHCPServer(
+            DHCPConfig(
+                interface="wlan1",
+                subnet=ipaddress.ip_network("10.42.7.0/24"),
+                server_ip="10.42.7.1",
+                lease_file=Path(self.tmp.name) / "leases.json",
+            )
+        )
+        self.client_id = bytes([OPT_CLIENT_ID, 3, 0x01, 0x02, 0x03])
+        self.key = bytes([0x01, 0x02, 0x03]).hex()
+
+    def lease_a_victim(self):
+        victim_mac = b"\x02\x00\x00\x00\x00\xaa"
+        self.server.handle(dhcp_packet(DISCOVER, mac=victim_mac, options=self.client_id))
+        self.server.handle(dhcp_packet(REQUEST, mac=victim_mac, options=self.client_id))
+        return self.server.leases[self.key]
+
+    def test_another_client_cannot_release_a_lease_by_naming_it(self):
+        held = self.lease_a_victim()
+        # A different device, quoting the victim's client identifier and
+        # pointing at a foreign server, so the release path is taken.
+        attacker = bytes([OPT_SERVER_ID, 4, 10, 42, 7, 99])
+        self.server.handle(
+            dhcp_packet(
+                REQUEST,
+                mac=b"\x02\x00\x00\x00\x00\xbb",
+                options=self.client_id + attacker,
+            )
+        )
+        self.assertIn(self.key, self.server.leases, "the victim's lease must survive")
+        self.assertEqual(self.server.leases[self.key].ip, held.ip)
+
+    def test_the_real_client_can_still_release_its_own_lease(self):
+        self.lease_a_victim()
+        foreign_server = bytes([OPT_SERVER_ID, 4, 10, 42, 7, 99])
+        self.server.handle(
+            dhcp_packet(
+                REQUEST,
+                mac=b"\x02\x00\x00\x00\x00\xaa",
+                options=self.client_id + foreign_server,
+            )
+        )
+        self.assertNotIn(self.key, self.server.leases)
+
+
+class DHCPPoolTests(unittest.TestCase):
+    """The pool is a window on the subnet, not a copy of it."""
+
+    def test_a_large_subnet_does_not_materialise_every_host(self):
+        # A /8 has nearly 17 million hosts and this runs inside the lock on
+        # every allocation. It must cost the size of the window, not the subnet.
+        server = DHCPServer(
+            DHCPConfig(
+                interface="wlan1",
+                subnet=ipaddress.ip_network("10.0.0.0/8"),
+                server_ip="10.0.0.1",
+            )
+        )
+        started = time.monotonic()
+        pool = server._pool()
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(pool), 190)
+        self.assertEqual(pool[0], "10.0.0.11")
+        self.assertLess(elapsed, 1.0, "the pool must not walk the whole subnet")
+
+    def test_a_small_subnet_is_bounded_by_the_subnet(self):
+        server = DHCPServer(
+            DHCPConfig(
+                interface="wlan1",
+                subnet=ipaddress.ip_network("10.42.7.0/26"),
+                server_ip="10.42.7.1",
+            )
+        )
+        self.assertEqual(len(server._pool()), 52)
 
 
 if __name__ == "__main__":
