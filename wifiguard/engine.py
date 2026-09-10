@@ -30,6 +30,9 @@ log = logging.getLogger(__name__)
 #: it is what keeps Firefox from silently routing around us.
 CANARY_DOMAIN = "use-application-dns.net"
 
+#: How many cache refreshes may run in the background at once.
+MAX_PREFETCH_THREADS = 8
+
 #: Zones that must never be sent to a public resolver: they are meaningless
 #: outside this network, and forwarding them leaks the local topology while
 #: guaranteeing an NXDOMAIN in return.
@@ -112,6 +115,9 @@ class FilterEngine:
         self.query_log = query_log
         self.config = config or EngineConfig()
         self._inflight = SingleFlight()
+        #: Ceiling on background refreshes running at once. Without it, a wave
+        #: of entries expiring together spawns one thread each.
+        self._prefetch_slots = threading.BoundedSemaphore(MAX_PREFETCH_THREADS)
         #: Set by the application when clustering is on, so a name resolved
         #: here is also cached on the other nodes.
         self.cluster = None
@@ -157,7 +163,13 @@ class FilterEngine:
             return None
 
         if header.opcode != 0:
-            return dnsmsg.build_error_response(query, dnsmsg.RCODE_NOTIMP)
+            # Built from the question section, which has not been parsed yet:
+            # a malformed one would otherwise raise out of handle() and be
+            # logged with a full traceback for every such packet.
+            try:
+                return dnsmsg.build_error_response(query, dnsmsg.RCODE_NOTIMP)
+            except dnsmsg.DNSFormatError:
+                return None
 
         try:
             question = dnsmsg.first_question(query)
@@ -401,6 +413,21 @@ class FilterEngine:
         checking_disabled: bool = False,
     ) -> tuple[bytes | None, bool]:
         """Fetch from upstream, collapsing duplicate concurrent lookups."""
+        if checking_disabled:
+            # CD means "do not validate DNSSEC on my behalf, I will do it".
+            # The answer therefore arrives unchecked, so it must not be cached
+            # or handed to a follower: either would downgrade DNSSEC for a
+            # device that never asked for it. Such queries are rare enough that
+            # resolving them on their own costs nothing.
+            try:
+                return self.upstreams.resolve(
+                    key.name, key.qtype, key.qclass,
+                    want_dnssec=key.dnssec, checking_disabled=True,
+                ), False
+            except ResolutionError as exc:
+                log.warning("could not resolve %s: %s", key.name, exc)
+                return None, False
+
         is_leader, event = self._inflight.leader(key)
 
         if not is_leader:
@@ -415,8 +442,7 @@ class FilterEngine:
         try:
             try:
                 response = self.upstreams.resolve(
-                    key.name, key.qtype, key.qclass,
-                    want_dnssec=key.dnssec, checking_disabled=checking_disabled,
+                    key.name, key.qtype, key.qclass, want_dnssec=key.dnssec,
                 )
             except ResolutionError as exc:
                 log.warning("could not resolve %s: %s", key.name, exc)
@@ -435,10 +461,20 @@ class FilterEngine:
             self._inflight.publish(key, response)
             return response, False
         finally:
-            self._inflight.cleanup(key)
+            # Releases the key even when the leader failed in a way it did not
+            # expect, so one bad answer cannot leave every later query for that
+            # name waiting on a leader that has gone.
+            self._inflight.done(key)
 
     def _schedule_prefetch(self, key: CacheKey) -> None:
         """Refresh a popular entry in the background, just before it expires."""
+        if not self._prefetch_slots.acquire(blocking=False):
+            # Refreshing is an optimisation, not an obligation. When many
+            # popular entries come due together, dropping the surplus is far
+            # better than spawning a thread per name: the entries stay valid,
+            # and whichever is asked for next is resolved the ordinary way.
+            self.cache.finish_refresh(key)
+            return
 
         def refresh() -> None:
             try:
@@ -451,6 +487,7 @@ class FilterEngine:
                 log.debug("prefetch of %s failed: %s", key.name, exc)
             finally:
                 self.cache.finish_refresh(key)
+                self._prefetch_slots.release()
 
         threading.Thread(target=refresh, name=f"prefetch-{key.name}", daemon=True).start()
 
@@ -520,11 +557,32 @@ def _prepare_reply(response: bytes, query: bytes) -> bytes:
     return reply
 
 
+_HEX_NIBBLES = frozenset("0123456789abcdef")
+
+
 def _is_private_reverse(name: str) -> bool:
     """Whether a reverse-lookup name covers a private address range."""
-    if name.endswith("ip6.arpa"):
-        # fc00::/7 and fe80::/10 reverse names begin with these nibbles.
-        return name.startswith(("c.f.", "d.f.", "0.8.e.f", "1.8.e.f", "e.f.", "f.f."))
+    if name.endswith(".ip6.arpa"):
+        # A reverse name spells the address out backwards -- least significant
+        # nibble first -- so the range is decided by the labels at the *end*,
+        # nearest ip6.arpa. Reversing them back into an address and testing it
+        # against the private ranges is both correct and obvious; a delegated
+        # zone covering a prefix is short, and zero-padding it preserves the
+        # prefix that decides the answer.
+        nibbles = list(reversed(name.removesuffix(".ip6.arpa").split(".")))
+        if not nibbles or len(nibbles) > 32:
+            return False
+        if any(nibble not in _HEX_NIBBLES for nibble in nibbles):
+            return False
+        packed = "".join(nibbles) + "0" * (32 - len(nibbles))
+        try:
+            address = ipaddress.IPv6Address(
+                ":".join(packed[index : index + 4] for index in range(0, 32, 4))
+            )
+        except ValueError:  # pragma: no cover - 32 hex nibbles always parse
+            return False
+        return any(address in network for network in _PRIVATE_V6)
+
     labels = name.removesuffix(".in-addr.arpa").split(".")
     try:
         octets = [int(label) for label in reversed(labels)]

@@ -321,25 +321,39 @@ class DNSCache:
 
         now = time.time()
         offset = len(_MAGIC)
+        # Bound before the try, not inside it: a file truncated to just the
+        # magic makes the very first unpack raise, and the handler whose whole
+        # job is to shrug off a corrupt file would itself fail on an unbound
+        # name.
+        restored = 0
         try:
             (count,) = struct.unpack_from("!I", raw, offset)
             offset += 4
-            restored = 0
             with self._lock:
                 for _ in range(count):
                     (name_len,) = struct.unpack_from("!H", raw, offset)
                     offset += 2
+                    if offset + name_len > len(raw):
+                        raise IndexError("name runs past the end of the file")
                     name = raw[offset : offset + name_len].decode("utf-8")
                     offset += name_len
                     qtype, qclass, dnssec = struct.unpack_from("!HHB", raw, offset)
                     offset += 5
                     stored_at, expires_at, ttl, hits, wire_len = struct.unpack_from("!ddIIH", raw, offset)
                     offset += struct.calcsize("!ddIIH")
+                    # Slicing past the end yields a short read rather than an
+                    # error, and a truncated message that still has a readable
+                    # header would be cached and served to a client.
+                    if offset + wire_len > len(raw):
+                        raise IndexError("response runs past the end of the file")
                     wire = raw[offset : offset + wire_len]
                     offset += wire_len
 
                     if now >= expires_at:
                         continue
+                    # Walked in full, so a message that survives cannot raise
+                    # later when its TTLs are rewritten on the way out.
+                    dnsmsg.message_ttl(wire)
                     self._entries[CacheKey(name, qtype, qclass, bool(dnssec))] = CacheEntry(
                         wire=wire,
                         stored_at=stored_at,
@@ -381,10 +395,21 @@ class SingleFlight:
     one answer.
     """
 
+    #: A published answer stays readable for this long. Setting an event wakes a
+    #: follower but does not run it: it still has to be scheduled and reacquire
+    #: the lock. Dropping the answer the moment the leader returns means the
+    #: follower almost always arrives to find it gone, and the collapse quietly
+    #: degrades into a second cache lookup -- which fails outright for an answer
+    #: that was not cacheable. A short window makes the handover reliable.
+    RESULT_GRACE = 2.0
+    #: Hard ceiling on retained answers, so a flood of distinct names inside one
+    #: grace window cannot grow this without bound.
+    MAX_RESULTS = 512
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._waiters: dict[CacheKey, threading.Event] = {}
-        self._results: dict[CacheKey, bytes | None] = {}
+        self._results: dict[CacheKey, tuple[bytes | None, float]] = {}
 
     def leader(self, key: CacheKey) -> tuple[bool, threading.Event]:
         """Claim a key. Returns (is_leader, event) -- followers wait on it."""
@@ -398,9 +423,11 @@ class SingleFlight:
 
     def publish(self, key: CacheKey, result: bytes | None) -> None:
         """Hand the leader's result to any followers and release them."""
+        now = time.monotonic()
         with self._lock:
-            self._results[key] = result
+            self._results[key] = (result, now)
             event = self._waiters.pop(key, None)
+            self._prune(now)
         if event is not None:
             event.set()
 
@@ -409,8 +436,32 @@ class SingleFlight:
         if not event.wait(timeout):
             return None
         with self._lock:
-            return self._results.get(key)
+            found = self._results.get(key)
+        return found[0] if found is not None else None
 
-    def cleanup(self, key: CacheKey) -> None:
+    def done(self, key: CacheKey) -> None:
+        """End a leader's turn, whether or not it managed to publish.
+
+        A leader that dies on an unexpected error would otherwise leave its
+        event in the map with nothing left to set it, and every later query for
+        that name would become a follower waiting the full timeout on a leader
+        that no longer exists -- for the life of the process.
+        """
         with self._lock:
-            self._results.pop(key, None)
+            event = self._waiters.pop(key, None)
+        if event is not None:
+            event.set()
+
+    def _prune(self, now: float) -> None:
+        """Drop answers nobody can still be waiting for. Caller holds the lock."""
+        if len(self._results) <= self.MAX_RESULTS // 2:
+            return
+        cutoff = now - self.RESULT_GRACE
+        self._results = {
+            key: value for key, value in self._results.items() if value[1] > cutoff
+        }
+        if len(self._results) > self.MAX_RESULTS:
+            # Still oversized: every entry is inside its grace window, so shed
+            # the oldest half rather than let a flood pin memory.
+            ordered = sorted(self._results.items(), key=lambda item: item[1][1])
+            self._results = dict(ordered[len(ordered) // 2 :])

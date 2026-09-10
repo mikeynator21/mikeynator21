@@ -9,7 +9,7 @@ are skipped by RDLENGTH rather than decoded.
 from __future__ import annotations
 
 import ipaddress
-import random
+import secrets
 import struct
 from typing import Iterator, NamedTuple
 
@@ -419,7 +419,11 @@ def build_query(name: str, qtype: int, want_edns: bool = True) -> bytes:
     """A recursive query for `name`, used for upstream lookups and health checks."""
     flags = 0x0100  # RD
     arcount = 1 if want_edns else 0
-    out = bytearray(struct.pack("!6H", random.getrandbits(16), flags, 1, 0, 0, arcount))
+    # The transaction ID is an anti-spoofing measure, not a nonce: on a plain
+    # UDP upstream it and the source port are the only things an off-path
+    # attacker has to guess. A predictable generator hands them the first and
+    # leaves only the second, so this comes from the system CSPRNG.
+    out = bytearray(struct.pack("!6H", secrets.randbits(16), flags, 1, 0, 0, arcount))
     out += encode_name(name)
     out += struct.pack("!HH", qtype, CLASS_IN)
     if want_edns:

@@ -45,6 +45,11 @@ class ServerConfig:
     #: Queries per second per client, averaged, with a burst allowance.
     rate_limit: float = 100.0
     rate_burst: int = 300
+    #: TCP connections served at once, in total and from any one client. A TCP
+    #: connection is held open between queries, so without a ceiling a handful
+    #: of idle connections would occupy every worker there is.
+    tcp_max_connections: int = 64
+    tcp_max_per_client: int = 8
 
 
 class RateLimiter:
@@ -89,6 +94,14 @@ class DNSServer:
         self._sockets: list[socket.socket] = []
         self._threads: list[threading.Thread] = []
         self._pool: ThreadPoolExecutor | None = None
+        #: TCP gets its own workers. Sharing the UDP pool meant a client that
+        #: opened a few connections and then said nothing could hold every
+        #: worker for the idle timeout, and all UDP resolution -- which is
+        #: essentially all real traffic -- stopped until it let go.
+        self._tcp_pool: ThreadPoolExecutor | None = None
+        self._tcp_lock = threading.Lock()
+        self._tcp_open = 0
+        self._tcp_per_client: dict[str, int] = {}
         self._stop = threading.Event()
         self._limiter = RateLimiter(self.config.rate_limit, self.config.rate_burst)
         self._allowed = [
@@ -96,6 +109,7 @@ class DNSServer:
         ]
         self.refused = 0
         self.rate_limited = 0
+        self.tcp_rejected = 0
 
     # -- lifecycle --------------------------------------------------------
 
@@ -104,6 +118,13 @@ class DNSServer:
         self._pool = ThreadPoolExecutor(
             max_workers=self.config.workers, thread_name_prefix="dns"
         )
+        if self.config.tcp_enabled:
+            # Sized to the connection ceiling so an accepted connection is
+            # always served rather than queued behind an idle one.
+            self._tcp_pool = ThreadPoolExecutor(
+                max_workers=max(1, self.config.tcp_max_connections),
+                thread_name_prefix="dns-tcp",
+            )
 
         for address in self.config.listen_addresses:
             self._start_udp(address)
@@ -129,9 +150,14 @@ class DNSServer:
         for thread in self._threads:
             thread.join(timeout=3)
         self._threads.clear()
-        if self._pool is not None:
-            self._pool.shutdown(wait=False, cancel_futures=True)
-            self._pool = None
+        for pool in (self._pool, self._tcp_pool):
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
+        self._pool = None
+        self._tcp_pool = None
+        with self._tcp_lock:
+            self._tcp_open = 0
+            self._tcp_per_client.clear()
         log.info("DNS listeners stopped")
 
     def _family_for(self, address: str) -> int:
@@ -261,10 +287,36 @@ class DNSServer:
             if not self._accept(client):
                 connection.close()
                 continue
-            if self._pool is None:
+            if self._tcp_pool is None:
                 connection.close()
                 return
-            self._pool.submit(self._handle_tcp, connection, client)
+            if not self._claim_tcp_slot(client):
+                self.tcp_rejected += 1
+                log.debug("refusing a TCP connection from %s: too many already open", client)
+                connection.close()
+                continue
+            self._tcp_pool.submit(self._handle_tcp, connection, client)
+
+    def _claim_tcp_slot(self, client: str) -> bool:
+        """Take a connection slot, or refuse when this client already has its share."""
+        with self._tcp_lock:
+            if self._tcp_open >= self.config.tcp_max_connections:
+                return False
+            held = self._tcp_per_client.get(client, 0)
+            if held >= self.config.tcp_max_per_client:
+                return False
+            self._tcp_open += 1
+            self._tcp_per_client[client] = held + 1
+            return True
+
+    def _release_tcp_slot(self, client: str) -> None:
+        with self._tcp_lock:
+            self._tcp_open = max(0, self._tcp_open - 1)
+            remaining = self._tcp_per_client.get(client, 1) - 1
+            if remaining > 0:
+                self._tcp_per_client[client] = remaining
+            else:
+                self._tcp_per_client.pop(client, None)
 
     def _handle_tcp(self, connection: socket.socket, client: str) -> None:
         try:
@@ -295,6 +347,8 @@ class DNSServer:
                     connection.sendall(struct.pack("!H", len(response)) + response)
         except (OSError, socket.timeout):
             return
+        finally:
+            self._release_tcp_slot(client)
 
     def stats(self) -> dict[str, object]:
         return {
@@ -302,6 +356,7 @@ class DNSServer:
             "tcp_enabled": self.config.tcp_enabled,
             "refused_out_of_network": self.refused,
             "rate_limited": self.rate_limited,
+            "tcp_connections_refused": self.tcp_rejected,
             "workers": self.config.workers,
         }
 

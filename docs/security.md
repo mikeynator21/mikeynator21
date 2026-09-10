@@ -88,7 +88,15 @@ cannot inject an answer for a name it did not send.
 **Cache poisoning.** Responses are checked for transaction ID, question name,
 type and class. On any plaintext upstream, 0x20 case randomisation is applied
 and the echoed case is verified, which raises the cost of blind spoofing
-considerably. Encrypted upstreams make it moot.
+considerably. Both the transaction ID and the case pattern come from the
+system CSPRNG — drawn from an ordinary seedable generator, a few observed
+queries would give away every one that followed, and neither measure would be
+worth anything. Encrypted upstreams make it moot.
+
+An answer fetched with the CD bit set — a client saying it will do its own
+DNSSEC validation — is never cached or shared, because it arrives unvalidated
+and handing it to a device that did not ask for that would downgrade DNSSEC on
+that device's behalf.
 
 **DNS rebinding.** A public name resolving into a private address range is
 rejected. This is the DNS half of an attack where a page loaded from the
@@ -99,6 +107,13 @@ the browser's origin.
 private networks are ignored entirely — not refused, ignored, because replying
 at all confirms the port is open. Per-client token-bucket rate limiting is on
 by default.
+
+**Resource exhaustion by a device on your own network.** A DNS-over-TCP
+connection stays open between queries, so TCP has its own workers and its own
+ceiling — in total and per client. Without that, a handful of connections
+opened and left silent would hold every worker until they timed out, and UDP
+resolution, which is very nearly all real traffic, would stop for everyone.
+Background cache refreshes are capped the same way.
 
 **Filter bypass.** Covered in the README under "Holding the line".
 

@@ -1,16 +1,23 @@
 """Tests for per-device policy, the filter engine and configuration."""
 
 import ipaddress
+import struct
 import tempfile
+import threading
 import unittest
 from datetime import datetime, time as clock_time
 from pathlib import Path
 
 from wifiguard import config as config_module, dnsmsg
 from wifiguard.blocklist import BlocklistManager
-from wifiguard.cache import CacheConfig, DNSCache
+from wifiguard.cache import CacheConfig, CacheKey, DNSCache
 from wifiguard.config import ConfigError, from_mapping
-from wifiguard.engine import EngineConfig, FilterEngine
+from wifiguard.engine import (
+    MAX_PREFETCH_THREADS,
+    EngineConfig,
+    FilterEngine,
+    _is_private_reverse,
+)
 from wifiguard.policy import Device, Group, PolicyEngine, Schedule
 from wifiguard.resolver import UpstreamPool
 from wifiguard.stats import QueryLog
@@ -297,6 +304,119 @@ class ConfigTests(unittest.TestCase):
     def test_network_group_mapping_validated(self):
         with self.assertRaises(ConfigError):
             from_mapping({"networks": {"group_by_network": {"not-a-subnet": "guest"}}})
+
+
+class PrivateReverseZoneTests(unittest.TestCase):
+    """A reverse name spells its address out backwards, least significant first.
+
+    Reading it from the wrong end sent link-local and unique-local reverse
+    lookups -- the layout of this network -- to a public resolver, and answered
+    a slice of genuinely public ones with a bogus NXDOMAIN.
+    """
+
+    def test_link_local_is_private(self):
+        name = "1" + ".0" * 28 + ".8.e.f.ip6.arpa"  # fe80::1
+        self.assertTrue(_is_private_reverse(name))
+
+    def test_unique_local_is_private(self):
+        name = "1" + ".0" * 29 + ".d.f.ip6.arpa"  # fd00::1
+        self.assertTrue(_is_private_reverse(name))
+
+    def test_loopback_is_private(self):
+        self.assertTrue(_is_private_reverse("1" + ".0" * 31 + ".ip6.arpa"))
+
+    def test_a_delegated_private_prefix_is_private(self):
+        self.assertTrue(_is_private_reverse("c.f.ip6.arpa"))
+
+    def test_public_address_is_not_private(self):
+        name = "1" + ".0" * 29 + ".0.f.ip6.arpa"  # f000::1
+        self.assertFalse(_is_private_reverse(name))
+
+    def test_documentation_prefix_is_not_private(self):
+        self.assertFalse(_is_private_reverse("8.b.d.0.1.0.0.2.ip6.arpa"))
+
+    def test_a_public_address_whose_low_nibbles_look_private(self):
+        # The old check read these two nibbles, at the wrong end of the name.
+        name = "c.f" + ".0" * 29 + ".2.0.ip6.arpa"
+        self.assertFalse(_is_private_reverse(name))
+
+    def test_nonsense_labels_are_not_private(self):
+        self.assertFalse(_is_private_reverse("zz.qq.ip6.arpa"))
+        self.assertFalse(_is_private_reverse("ip6.arpa"))
+
+    def test_ipv4_private_and_public(self):
+        self.assertTrue(_is_private_reverse("1.0.168.192.in-addr.arpa"))
+        self.assertTrue(_is_private_reverse("168.192.in-addr.arpa"))
+        self.assertFalse(_is_private_reverse("1.0.0.8.in-addr.arpa"))
+
+
+class EngineRobustnessTests(unittest.TestCase):
+    """Paths that used to raise out of handle() or downgrade another client."""
+
+    # The same fixture as EngineTests, borrowed rather than inherited:
+    # subclassing would re-run every test above under a second name.
+    setUp = EngineTests.setUp
+    _ask = EngineTests._ask
+
+    def test_non_query_opcode_with_a_broken_question(self):
+        # STATUS opcode, one question, and nothing where the question should be.
+        query = struct.pack("!6H", 0x1234, 0x1000, 1, 0, 0, 0) + b"\xc0"
+        self.assertIsNone(self.engine.handle(query, "127.0.0.1"))
+
+    def test_non_query_opcode_with_a_good_question(self):
+        query = bytearray(dnsmsg.build_query("example.com", dnsmsg.TYPE_A))
+        query[2:4] = struct.pack("!H", 0x1000)  # opcode STATUS
+        reply = self.engine.handle(bytes(query), "127.0.0.1")
+        self.assertEqual(dnsmsg.parse_header(reply).rcode, dnsmsg.RCODE_NOTIMP)
+
+    def test_a_checking_disabled_answer_is_not_cached(self):
+        # CD says "do not validate for me". That answer is unchecked, so it must
+        # not be handed to a device that did not ask for the downgrade.
+        answered = dnsmsg.build_address_response(
+            dnsmsg.build_query("cd.example", dnsmsg.TYPE_A), dnsmsg.TYPE_A, "1.2.3.4", 300
+        )
+        self.engine.upstreams.resolve = lambda *a, **k: answered
+
+        query = bytearray(dnsmsg.build_query("cd.example", dnsmsg.TYPE_A))
+        query[2:4] = struct.pack("!H", 0x0110)  # RD + CD
+        self.assertIsNotNone(self.engine.handle(bytes(query), "127.0.0.1"))
+
+        key = CacheKey("cd.example", dnsmsg.TYPE_A, dnsmsg.CLASS_IN)
+        self.assertIsNone(self.engine.cache.get(key), "a CD answer must not be cached")
+
+    def test_an_ordinary_answer_is_still_cached(self):
+        answered = dnsmsg.build_address_response(
+            dnsmsg.build_query("ok.example", dnsmsg.TYPE_A), dnsmsg.TYPE_A, "1.2.3.4", 300
+        )
+        self.engine.upstreams.resolve = lambda *a, **k: answered
+        self.assertIsNotNone(self._ask("ok.example"))
+        key = CacheKey("ok.example", dnsmsg.TYPE_A, dnsmsg.CLASS_IN)
+        self.assertIsNotNone(self.engine.cache.get(key))
+
+    def test_prefetch_threads_are_capped(self):
+        # Every key claims a slot and never releases it, because the refresh
+        # thread blocks. The surplus must be dropped, not turned into threads.
+        started = threading.Semaphore(0)
+        release = threading.Event()
+
+        def blocking_resolve(*args, **kwargs):
+            started.release()
+            release.wait(5)
+            return b""
+
+        self.engine.upstreams.resolve = blocking_resolve
+        self.addCleanup(release.set)
+
+        for index in range(MAX_PREFETCH_THREADS * 4):
+            self.engine._schedule_prefetch(
+                CacheKey(f"n{index}.example", dnsmsg.TYPE_A, dnsmsg.CLASS_IN)
+            )
+
+        for _ in range(MAX_PREFETCH_THREADS):
+            self.assertTrue(started.acquire(timeout=5))
+        self.assertFalse(
+            started.acquire(timeout=0.5), "no more than the cap may run at once"
+        )
 
 
 if __name__ == "__main__":

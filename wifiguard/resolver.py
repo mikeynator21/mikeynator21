@@ -20,7 +20,7 @@ from __future__ import annotations
 import http.client
 import logging
 import queue
-import random
+import secrets
 import socket
 import ssl
 import struct
@@ -367,11 +367,18 @@ def build_upstream(
 
 
 def apply_0x20(name: str) -> str:
-    """Randomise the case of a name, per the DNS-0x20 anti-spoofing draft."""
-    return "".join(
-        character.upper() if character.isalpha() and random.getrandbits(1) else character
-        for character in name
-    )
+    """Randomise the case of a name, per the DNS-0x20 anti-spoofing draft.
+
+    The case pattern is a secret the attacker has to guess along with the
+    transaction ID, so it comes from the system CSPRNG: drawn from a predictable
+    generator, a handful of observed queries would give the rest away and the
+    measure would protect nothing.
+    """
+    bits = secrets.randbits(max(len(name), 1))
+    out = []
+    for index, character in enumerate(name):
+        out.append(character.upper() if character.isalpha() and (bits >> index) & 1 else character)
+    return "".join(out)
 
 
 class UpstreamPool:

@@ -248,5 +248,40 @@ class ValidationTests(unittest.TestCase):
             _validate_response(query, query, "example.com", dnsmsg.TYPE_A, 1, strict_case=False)
 
 
+class Case0x20Tests(unittest.TestCase):
+    """The case pattern is a secret shared with the upstream for one query."""
+
+    def test_the_name_is_unchanged_apart_from_case(self):
+        for _ in range(50):
+            self.assertEqual(apply_0x20("example.com").lower(), "example.com")
+
+    def test_the_pattern_varies(self):
+        patterns = {apply_0x20("a-fairly-long-name.example.com") for _ in range(200)}
+        self.assertGreater(len(patterns), 150, "the pattern must not be predictable")
+
+    def test_digits_and_punctuation_are_left_alone(self):
+        self.assertTrue(all(
+            character in "0123456789.-" or character.isalpha()
+            for character in apply_0x20("s3-1.example.com")
+        ))
+        for _ in range(50):
+            randomised = apply_0x20("s3-1.example.com")
+            self.assertEqual(randomised[1:5], "3-1.")
+
+    def test_it_does_not_come_from_the_seedable_generator(self):
+        import random
+
+        random.seed(99)
+        first = apply_0x20("example.com")
+        random.seed(99)
+        second = apply_0x20("example.com")
+        # A predictable generator would give the same pattern twice; with 11
+        # letters the chance of a genuine collision is about one in 2048.
+        self.assertNotEqual(first, second)
+
+    def test_an_empty_name_is_handled(self):
+        self.assertEqual(apply_0x20(""), "")
+
+
 if __name__ == "__main__":
     unittest.main()

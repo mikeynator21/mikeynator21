@@ -159,5 +159,26 @@ class CnameTests(unittest.TestCase):
         self.assertEqual(dnsmsg.cname_chain(bytes(message)), ["tracker.cdn.example"])
 
 
+class TransactionIdTests(unittest.TestCase):
+    """On a plain upstream the ID and the source port are the only secrets."""
+
+    def test_ids_are_spread_across_the_range(self):
+        ids = [dnsmsg.parse_header(dnsmsg.build_query("a.test", dnsmsg.TYPE_A)).id
+               for _ in range(500)]
+        self.assertGreater(len(set(ids)), 480, "transaction IDs must not repeat")
+        self.assertGreater(max(ids), 0xC000)
+        self.assertLess(min(ids), 0x4000)
+
+    def test_ids_do_not_come_from_the_seedable_generator(self):
+        # random.seed() must not make the next query predictable.
+        import random
+
+        random.seed(1234)
+        first = dnsmsg.parse_header(dnsmsg.build_query("a.test", dnsmsg.TYPE_A)).id
+        random.seed(1234)
+        second = dnsmsg.parse_header(dnsmsg.build_query("a.test", dnsmsg.TYPE_A)).id
+        self.assertNotEqual(first, second)
+
+
 if __name__ == "__main__":
     unittest.main()

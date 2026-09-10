@@ -1,12 +1,14 @@
 """Tests for the DNS cache: TTLs, staleness, prefetch and persistence."""
 
+import gzip
+import struct
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
 from wifiguard import dnsmsg
-from wifiguard.cache import CacheConfig, CacheKey, DNSCache, SingleFlight
+from wifiguard.cache import _MAGIC, CacheConfig, CacheKey, DNSCache, SingleFlight
 
 
 def make_reply(name="example.com", ttl=300, address="1.2.3.4"):
@@ -181,6 +183,87 @@ class SingleFlightTests(unittest.TestCase):
         flight.leader(KEY)
         _, event = flight.leader(KEY)
         self.assertIsNone(flight.collect(KEY, event, timeout=0.05))
+
+
+class SingleFlightHandoverTests(unittest.TestCase):
+    """The leader's answer has to survive long enough for a follower to read it."""
+
+    def test_follower_still_sees_a_published_answer_after_the_leader_finishes(self):
+        # The leader publishes and then immediately ends its turn, which is what
+        # happens in the engine's `finally`. A follower woken by the publish is
+        # scheduled some time after that, and must still find the answer.
+        flight = SingleFlight()
+        flight.leader(KEY)
+        _, event = flight.leader(KEY)
+
+        flight.publish(KEY, b"answer")
+        flight.done(KEY)
+
+        self.assertEqual(flight.collect(KEY, event, timeout=1), b"answer")
+
+    def test_a_leader_that_never_publishes_releases_the_key(self):
+        # Without this the event stays in the map with nothing left to set it,
+        # and every later query for the name waits the full timeout forever.
+        flight = SingleFlight()
+        is_leader, _ = flight.leader(KEY)
+        self.assertTrue(is_leader)
+
+        flight.done(KEY)  # died before publishing
+
+        is_leader_again, _ = flight.leader(KEY)
+        self.assertTrue(is_leader_again, "the next caller must be able to lead")
+
+    def test_a_released_follower_is_not_left_waiting(self):
+        flight = SingleFlight()
+        flight.leader(KEY)
+        _, event = flight.leader(KEY)
+
+        flight.done(KEY)
+
+        self.assertTrue(event.wait(1), "done() must wake anyone already waiting")
+        self.assertIsNone(flight.collect(KEY, event, timeout=1))
+
+    def test_retained_answers_are_bounded(self):
+        flight = SingleFlight()
+        for index in range(SingleFlight.MAX_RESULTS * 3):
+            key = CacheKey(f"name{index}.example", 1, 1)
+            flight.leader(key)
+            flight.publish(key, b"x")
+            flight.done(key)
+        self.assertLessEqual(len(flight._results), SingleFlight.MAX_RESULTS)
+
+
+class CorruptCacheFileTests(unittest.TestCase):
+    """A damaged cache file is ignored, never fatal: it is only an optimisation."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "dnscache.bin"
+
+    def _load(self, payload):
+        self.path.write_bytes(gzip.compress(payload))
+        return DNSCache(CacheConfig(persist_path=self.path)).load()
+
+    def test_file_truncated_to_the_magic(self):
+        self.assertEqual(self._load(bytes(_MAGIC)), 0)
+
+    def test_entry_count_larger_than_the_body(self):
+        self.assertEqual(self._load(bytes(_MAGIC) + struct.pack("!I", 5) + b"\x00\x03abc"), 0)
+
+    def test_a_name_running_past_the_end(self):
+        body = struct.pack("!I", 1) + struct.pack("!H", 999) + b"short"
+        self.assertEqual(self._load(bytes(_MAGIC) + body), 0)
+
+    def test_a_response_running_past_the_end(self):
+        # A message claiming more bytes than the file holds would otherwise be
+        # stored short, and blow up later while its TTLs were rewritten.
+        body = bytearray(struct.pack("!I", 1))
+        body += struct.pack("!H", 3) + b"abc"
+        body += struct.pack("!HHB", 1, 1, 0)
+        body += struct.pack("!ddIIH", time.time(), time.time() + 3600, 3600, 0, 4096)
+        body += b"\x00" * 20
+        self.assertEqual(self._load(bytes(_MAGIC) + bytes(body)), 0)
 
 
 if __name__ == "__main__":
