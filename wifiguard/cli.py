@@ -76,6 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="assess the network this machine is on, and what WiFiGuard would change",
     )
     fieldtest.add_argument("--quick", action="store_true", help="skip the slower probes")
+    fieldtest.add_argument(
+        "--json", action="store_true",
+        help="print a structured summary, for sharing the result somewhere",
+    )
 
     selftest = sub.add_parser("selftest", help="run the full stack locally and verify it")
     selftest.add_argument("--port", type=int, default=15353, help="port to test on")
@@ -355,8 +359,15 @@ def command_fieldtest(args: argparse.Namespace, cfg: Config) -> int:
     """Report on the network this machine is actually attached to."""
     from . import fieldtest
 
-    print("Assessing this network. Nothing is modified.\n")
+    if not args.json:
+        print("Assessing this network. Nothing is modified.\n")
+
     report = fieldtest.run(quick=args.quick)
+
+    if args.json:
+        print(json.dumps(report.as_dict(), indent=2))
+        return 1 if report.by_severity("problem") else 0
+
     print(report.render(), end="")
 
     problems = report.by_severity("problem")

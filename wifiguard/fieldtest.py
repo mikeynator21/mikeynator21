@@ -75,6 +75,30 @@ class Finding:
 class FieldReport:
     findings: list[Finding] = field(default_factory=list)
 
+    def as_dict(self) -> dict:
+        """A structured summary, for pasting somewhere it can be read back.
+
+        Deliberately carries no addresses from the network being tested beyond
+        the resolver in use -- a report you might paste into a chat should not
+        be a map of your house.
+        """
+        counts = {}
+        for finding in self.findings:
+            counts[finding.severity] = counts.get(finding.severity, 0) + 1
+        return {
+            "wifiguard_fieldtest": 1,
+            "summary": counts,
+            "findings": [
+                {
+                    "check": finding.key,
+                    "severity": finding.severity,
+                    "title": finding.title,
+                    "detail": finding.detail,
+                }
+                for finding in self.findings
+            ],
+        }
+
     def add(self, *args, **kwargs) -> Finding:
         finding = Finding(*args, **kwargs)
         self.findings.append(finding)

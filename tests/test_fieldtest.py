@@ -51,6 +51,42 @@ class ReportTests(unittest.TestCase):
         self.assertTrue(all(len(line) < 100 for line in lines))
 
 
+class JsonOutputTests(unittest.TestCase):
+    """The shareable summary, which is how a result gets off the tested network."""
+
+    def _report(self):
+        report = FieldReport()
+        report.add("interception", "problem", "This network intercepts DNS", "detail here")
+        report.add("nxdomain", "ok", "NXDOMAIN is honoured")
+        report.add("ipv6", "warn", "IPv6 present")
+        return report
+
+    def test_summary_counts_by_severity(self):
+        payload = self._report().as_dict()
+        self.assertEqual(payload["summary"], {"problem": 1, "ok": 1, "warn": 1})
+
+    def test_every_finding_is_included(self):
+        payload = self._report().as_dict()
+        self.assertEqual(len(payload["findings"]), 3)
+        self.assertEqual(payload["findings"][0]["check"], "interception")
+        self.assertEqual(payload["findings"][0]["severity"], "problem")
+
+    def test_remedies_are_left_out(self):
+        # The remedy is advice for the person running it, not part of the
+        # result; including it would double the size of something meant to be
+        # pasted into a message.
+        payload = self._report().as_dict()
+        self.assertNotIn("remedy", payload["findings"][0])
+
+    def test_output_is_json_serialisable(self):
+        import json
+
+        json.loads(json.dumps(self._report().as_dict()))
+
+    def test_carries_a_format_marker(self):
+        self.assertEqual(self._report().as_dict()["wifiguard_fieldtest"], 1)
+
+
 class ProbeTests(unittest.TestCase):
     def test_impossible_resolvers_are_reserved_ranges(self):
         """The interception probe is only meaningful if nothing can live there."""

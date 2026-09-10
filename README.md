@@ -61,6 +61,14 @@ cd wifiguard
 sudo ./install.sh
 ```
 
+Nothing is compiled and nothing is fetched, so you can also just run it out of
+the clone without installing at all:
+
+```bash
+python3 -m wifiguard.cli fieldtest
+python3 -m wifiguard.cli selftest
+```
+
 Then check the machine is ready and prove the filtering works:
 
 ```bash
@@ -101,6 +109,9 @@ $ wifiguard fieldtest
         -> Pin the resolver's real key so WiFiGuard refuses to resolve rather
         -> than talking through the interception.
 ```
+
+Add `--json` for a summary you can paste somewhere — it carries the findings
+and nothing about your network's addresses.
 
 It checks whether port 53 is intercepted, whether answers are being rewritten,
 whether failed lookups are redirected to an ads page, whether encrypted DNS can
@@ -282,7 +293,7 @@ Worked examples are in [deploy/examples/](deploy/examples/).
 Three layers, each proving something the one below it cannot.
 
 ```bash
-python3 -m unittest discover -s tests -v      # 304 unit tests, no network needed
+python3 -m unittest discover -s tests -v      # 309 unit tests, no network needed
 wifiguard selftest                            # 55 checks, the real stack on loopback
 sudo ./tests/integration/run.sh               # 66 checks on a virtual network
 ```
