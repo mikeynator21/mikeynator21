@@ -1,8 +1,10 @@
 """Tests for the gateway: firewall rules, DHCP, clustering and networks."""
 
 import ipaddress
+import shutil
 import socket
 import struct
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -71,6 +73,38 @@ class FirewallRuleTests(unittest.TestCase):
     def test_clients_isolated_from_the_joined_network(self):
         self.assertIn('iifname "wlan1" oifname "wlan0" drop', self.rules())
 
+    def test_isolation_needs_the_uplink_subnet(self):
+        # Without knowing the subnet there is nothing to isolate against, and
+        # the setting silently does nothing -- which is worth asserting so the
+        # caller is required to supply it.
+        self.assertNotIn("ip daddr", self.rules().split("chain forward")[1].split("accept")[0])
+
+    def test_isolation_drops_the_uplink_subnet(self):
+        text = self.rules(uplink_subnet="192.168.1.0/24")
+        self.assertIn('iifname "wlan1" ip daddr 192.168.1.0/24 drop', text)
+
+    def test_isolation_precedes_the_accept_that_would_shadow_it(self):
+        """Rule order is the whole point.
+
+        nftables takes the first matching rule, so an isolation drop placed
+        after the accept never runs. This asserts the ordering directly rather
+        than just the presence of both rules.
+        """
+        forward = self.rules(uplink_subnet="192.168.1.0/24").split("chain forward")[1]
+        drop_at = forward.index("ip daddr 192.168.1.0/24 drop")
+        accept_at = forward.index('oifname "wlan0" ip version 4 accept')
+        self.assertLess(drop_at, accept_at)
+
+    def test_isolation_can_be_turned_off(self):
+        text = self.rules(uplink_subnet="192.168.1.0/24", isolate_from_uplink=False)
+        self.assertNotIn("ip daddr 192.168.1.0/24 drop", text)
+
+    def test_isolation_still_allows_the_internet(self):
+        # Only the uplink's own subnet is dropped; everything beyond it is
+        # accepted out of the uplink interface.
+        text = self.rules(uplink_subnet="192.168.1.0/24")
+        self.assertIn('iifname "wlan1" oifname "wlan0" ip version 4 accept', text)
+
     def test_vpn_kill_switch_pins_the_tunnel(self):
         text = self.rules(vpn_interface="wg0")
         self.assertIn('oifname "wg0"', text)
@@ -81,6 +115,84 @@ class FirewallRuleTests(unittest.TestCase):
 
     def test_resolver_not_exposed_to_the_joined_network(self):
         self.assertIn('iifname "wlan0" udp dport 53 drop', self.rules())
+
+
+class RulesetSyntaxTests(unittest.TestCase):
+    """Validate the ruleset with nft itself, not just by matching strings.
+
+    Checking that the generated text contains the right substrings does not
+    prove the kernel will accept it -- an invalid chain hook renders a ruleset
+    that reads correctly and loads on nothing. `nft -c` parses and validates
+    without applying, which catches that.
+    """
+
+    def setUp(self):
+        if shutil.which("nft") is None:
+            self.skipTest("nft is not installed")
+
+    def _validate(self, text: str) -> None:
+        result = subprocess.run(
+            ["nft", "-c", "-f", "-"], input=text,
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        if result.returncode != 0:
+            message = result.stderr.strip()
+            if "Operation not permitted" in message or "Permission denied" in message:
+                self.skipTest("nft check mode needs privileges here")
+            self.fail(f"nft rejected the generated ruleset:\n{message}")
+
+    def test_ruleset_with_isolation_is_valid(self):
+        self._validate(
+            firewall.build_ruleset(
+                firewall.GatewayRules(
+                    ap_interface="wlan1", uplink_interface="wlan0", subnet=SUBNET,
+                    uplink_subnet="192.168.1.0/24",
+                )
+            )
+        )
+
+    def test_default_ruleset_is_valid(self):
+        self._validate(
+            firewall.build_ruleset(
+                firewall.GatewayRules(
+                    ap_interface="wlan1", uplink_interface="wlan0", subnet=SUBNET
+                )
+            )
+        )
+
+    def test_ruleset_valid_with_vpn_killswitch(self):
+        self._validate(
+            firewall.build_ruleset(
+                firewall.GatewayRules(
+                    ap_interface="wlan1", uplink_interface="wlan0", subnet=SUBNET,
+                    vpn_interface="wg0",
+                )
+            )
+        )
+
+    def test_ruleset_valid_with_ipv6_and_no_bypass_blocking(self):
+        self._validate(
+            firewall.build_ruleset(
+                firewall.GatewayRules(
+                    ap_interface="wlan1", uplink_interface="wlan0", subnet=SUBNET,
+                    allow_ipv6=True, block_encrypted_dns_bypass=False,
+                    extra_allowed_ports=[8443],
+                )
+            )
+        )
+
+    def test_nat_hooks_are_real_hooks(self):
+        # srcnat and dstnat are priorities, not hooks; confusing the two
+        # produces a ruleset the kernel refuses outright.
+        text = firewall.build_ruleset(
+            firewall.GatewayRules(
+                ap_interface="wlan1", uplink_interface="wlan0", subnet=SUBNET
+            )
+        )
+        self.assertIn("type nat hook prerouting priority dstnat", text)
+        self.assertIn("type nat hook postrouting priority srcnat", text)
+        self.assertNotIn("hook srcnat", text)
+        self.assertNotIn("hook dstnat", text)
 
 
 class HotspotConfigTests(unittest.TestCase):

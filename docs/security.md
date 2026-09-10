@@ -102,9 +102,12 @@ by default.
 
 **Filter bypass.** Covered in the README under "Holding the line".
 
-**Local network attack, on a hostile LAN.** In gateway mode, clients are
-isolated from the network the laptop joined. On a hotel or cafe segment shared
-with strangers, this is the isolation that makes plugging in safe.
+**Local network attack, on a hostile LAN.** In gateway mode, clients may route
+through the network the laptop joined but cannot reach hosts on it. The rule
+drops traffic to the uplink's current subnet and is ordered ahead of the accept
+that would otherwise match first — rule order being the whole of the control,
+since nftables takes the first match. The integration testbed asserts both the
+ordering and the resulting behaviour.
 
 ## What it does not protect against
 
@@ -170,4 +173,11 @@ To see the exact firewall rules on a running gateway:
 
 ```bash
 sudo wifiguard gateway rules
+```
+
+And to watch the controls above being enforced by a real kernel against real
+clients, rather than taking this page's word for it:
+
+```bash
+sudo ./tests/integration/run.sh
 ```

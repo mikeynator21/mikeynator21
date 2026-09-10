@@ -73,6 +73,14 @@ class GatewayRules:
     vpn_interface: str | None = None
     #: Reject DoT and known DoH endpoints so clients cannot bypass the filter.
     block_encrypted_dns_bypass: bool = True
+    #: Stop clients reaching other hosts on the network the gateway joined,
+    #: while still letting them reach the internet through it. Needs
+    #: `uplink_subnet` to be known; without it there is nothing to isolate
+    #: against and the setting has no effect.
+    isolate_from_uplink: bool = True
+    #: The uplink's own subnet, e.g. "192.168.1.0/24". Discovered at run time,
+    #: because it changes every time the gateway joins a different network.
+    uplink_subnet: str = ""
     #: Forward IPv6 for clients. Off by default: an unfiltered v6 path defeats
     #: the point of the gateway.
     allow_ipv6: bool = False
@@ -126,6 +134,16 @@ def build_ruleset(rules: GatewayRules) -> str:
         iifname "{ap}" ip6 daddr {{ {v6_set} }} reject with icmpv6 type admin-prohibited
 """
 
+    isolation_rules = ""
+    if rules.isolate_from_uplink and rules.uplink_subnet:
+        isolation_rules = f"""
+        # Clients reach the internet *through* the joined network, but not the
+        # hosts sharing it. On a hotel or cafe LAN that segment is full of
+        # strangers' machines, and this is the isolation that makes plugging in
+        # safe. It must come before the accept below, which would match first.
+        iifname "{ap}" ip daddr {rules.uplink_subnet} drop
+"""
+
     ipv6_forward = (
         f'        iifname "{ap}" oifname "{uplink}" accept'
         if rules.allow_ipv6
@@ -146,7 +164,7 @@ table ip {NAT_TABLE} {{
     }}
 
     chain postrouting {{
-        type nat hook srcnat priority srcnat; policy accept;
+        type nat hook postrouting priority srcnat; policy accept;
 
         ip saddr {subnet} oifname "{uplink}" masquerade
     }}
@@ -176,16 +194,18 @@ table inet {FILTER_TABLE} {{
 
         ct state established,related accept
         ct state invalid drop
-{bypass_rules}
+{bypass_rules}{isolation_rules}
         # Clients reach the internet only through the intended uplink. With a
         # VPN configured that is the tunnel, so a tunnel that goes down takes
         # client connectivity with it rather than leaking in the clear.
         iifname "{ap}" oifname "{uplink}" ip version 4 accept
 {ipv6_forward}
 
-        # Clients must not reach the network the laptop joined. On a hotel or
-        # cafe LAN that is a hostile segment, and this is the isolation that
-        # makes plugging in safe.
+        # With a VPN configured, the line above only accepted traffic leaving
+        # through the tunnel; this stops anything else escaping via the real
+        # uplink. Without a VPN the two name the same interface and this is
+        # redundant, which is why isolation above is written against the
+        # subnet rather than the interface.
         iifname "{ap}" oifname "{rules.uplink_interface}" drop
     }}
 

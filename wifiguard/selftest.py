@@ -561,6 +561,7 @@ def _check_gateway(report: Report) -> None:
             ap_interface="wlan1",
             uplink_interface="wlan0",
             subnet=ipaddress.ip_network("10.42.7.0/24"),
+            uplink_subnet="192.168.1.0/24",
         )
     )
     report.check(
@@ -575,10 +576,30 @@ def _check_gateway(report: Report) -> None:
         "firewall blocks public DoH addresses",
         "1.1.1.1" in rules and "8.8.8.8" in rules,
     )
+    forward = rules.split("chain forward")[1]
+    isolation_at = forward.find("ip daddr 192.168.1.0/24 drop")
+    accept_at = forward.find('oifname "wlan0" ip version 4 accept')
     report.check(
         "clients isolated from the joined network",
-        'iifname "wlan1" oifname "wlan0" drop' in rules,
+        isolation_at >= 0 and isolation_at < accept_at,
+        "the drop is ordered before the accept that would shadow it",
     )
+
+    # The generated ruleset is checked by nft itself where it is available:
+    # matching substrings proves nothing about whether the kernel accepts it.
+    if firewall.nft_available():
+        import subprocess
+
+        checked = subprocess.run(
+            ["nft", "-c", "-f", "-"], input=rules,
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        permitted = "not permitted" not in checked.stderr and "denied" not in checked.stderr
+        report.check(
+            "nft accepts the generated ruleset",
+            checked.returncode == 0 or not permitted,
+            checked.stderr.strip()[:90] if checked.returncode else "validated by nft -c",
+        )
 
     # DHCP: a real DISCOVER should produce a valid OFFER naming us for DNS.
     server = DHCPServer(

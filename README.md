@@ -204,14 +204,32 @@ Worked examples are in [deploy/examples/](deploy/examples/).
 
 ## Tests
 
+Three layers, each proving something the one below it cannot.
+
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v      # 225 unit tests, no network needed
+wifiguard selftest                            # 43 checks, the real stack on loopback
+sudo ./tests/integration/run.sh               # 45 checks on a virtual network
 ```
 
-193 tests, no network access required. The X25519 implementation is checked
-against the RFC 7748 vectors, and the QR encoder against the 32 published
-format strings plus a geometry cross-check on all 80 version/level
-combinations.
+**Unit tests** cover the pieces. X25519 is checked against the RFC 7748
+vectors, the QR encoder against the 32 published format strings plus a geometry
+cross-check on all 80 version/level combinations, and the firewall ruleset is
+validated by `nft` itself rather than by matching strings.
+
+**`wifiguard selftest`** runs the real resolver, cache, policy engine and DHCP
+server in one process against a stub upstream. No root, no internet. This is
+what to run after installing.
+
+**The integration testbed** builds a virtual network out of Linux network
+namespaces — a gateway, a phone, a smart TV, a guest network and a stub
+internet, each with its own network stack — and drives it with ordinary tools.
+It is what proves the claims that only hold once a kernel is involved: that a
+device with a hardcoded `8.8.8.8` is answered by us anyway, that DNS-over-TLS
+is refused in milliseconds, that a client can route *through* the network you
+joined without reaching hosts *on* it. See
+[tests/integration/README.md](tests/integration/README.md), including the two
+real bugs it caught that the unit tests could not.
 
 ## Requirements
 

@@ -56,8 +56,9 @@ the internet, and:
   resolver is answered by us anyway.
 - **Encrypted lookups**, so the hotel's network sees no DNS at all.
 - **Isolation from the joined network.** A hotel LAN is a hostile segment
-  shared with strangers' laptops. Clients can reach the internet through us and
-  nothing else on it.
+  shared with strangers' laptops. Clients route *through* it to the internet
+  but cannot reach anything *on* it — the rule is written against the uplink's
+  current subnet, which is re-read every time you join a different network.
 - **WPA3 where the device supports it**, WPA2 where it does not, on one SSID.
   WPA3's SAE handshake means a captured handshake cannot be attacked offline
   with a wordlist.

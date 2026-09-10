@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..config import Config
-from . import firewall, interfaces
+from . import firewall, interfaces, networks
 from .dhcp import DHCPConfig, DHCPServer
 from .hotspot import Hotspot, HotspotConfig, pick_channel
 
@@ -244,6 +244,8 @@ class GatewayManager:
             dashboard_port=self.config.dashboard.port,
             vpn_interface=vpn_interface,
             allow_ipv6=settings.allow_ipv6,
+            isolate_from_uplink=settings.isolate_from_uplink,
+            uplink_subnet=self._uplink_subnet(uplink),
         )
         firewall.apply_rules(rules)
 
@@ -252,6 +254,19 @@ class GatewayManager:
             self.state.uplink_fingerprint = interfaces.uplink_fingerprint()
             self.state.rules_applied = True
             self.state.vpn_interface = vpn_interface or ""
+
+    @staticmethod
+    def _uplink_subnet(uplink: str) -> str:
+        """The subnet the uplink interface currently sits in.
+
+        Re-read on every rule rebuild, because it changes with every network
+        the gateway joins -- which is the whole reason isolation cannot be
+        written into a static config file.
+        """
+        for local in networks.discover_local_networks():
+            if local.interface == uplink:
+                return str(local.network)
+        return ""
 
     def _watch(self) -> None:
         """Reapply NAT whenever the laptop moves to a different network."""
