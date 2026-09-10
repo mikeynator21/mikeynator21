@@ -266,16 +266,29 @@ def next_steps(answers: Answers, path: Path) -> list[str]:
     """What the person has to do now, in order."""
     steps = [f"Config written to {path}."]
 
+    systemd = _systemd_available()
+
     if _port_in_use(53):
-        steps.append(
-            "Port 53 is busy -- usually systemd-resolved. Free it first:\n"
-            "       sudo systemctl disable --now systemd-resolved\n"
-            "       sudo rm -f /etc/resolv.conf\n"
-            "       echo 'nameserver 127.0.0.1' | sudo tee /etc/resolv.conf"
-        )
+        if systemd:
+            steps.append(
+                "Port 53 is busy -- usually systemd-resolved. Free it first:\n"
+                "       sudo systemctl disable --now systemd-resolved\n"
+                "       sudo rm -f /etc/resolv.conf\n"
+                "       echo 'nameserver 127.0.0.1' | sudo tee /etc/resolv.conf"
+            )
+        else:
+            steps.append(
+                "Port 53 is busy. Stop whatever is holding it first, or set\n"
+                "       server.port in the config to a port that is free."
+            )
 
     steps.append("Check the machine is ready:  sudo wifiguard doctor")
-    steps.append("Start it:                    sudo systemctl enable --now wifiguard")
+    if systemd:
+        steps.append("Start it:                    sudo systemctl enable --now wifiguard")
+    else:
+        # Termux, a container, WSL without systemd -- all documented places to
+        # run this, and none of them can enable a unit.
+        steps.append("Start it:                    sudo wifiguard run")
 
     if answers.role == "network":
         steps.append(
@@ -298,6 +311,16 @@ def next_steps(answers: Answers, path: Path) -> list[str]:
 
     steps.append("Confirm it works:            wifiguard selftest")
     return steps
+
+
+def _systemd_available() -> bool:
+    """Whether a unit can actually be enabled here.
+
+    `systemctl` on PATH is not the question -- a container, a chroot and WSL
+    all have the binary with no systemd behind it. /run/systemd/system exists
+    only when systemd is the init system, which is the condition that matters.
+    """
+    return shutil.which("systemctl") is not None and Path("/run/systemd/system").is_dir()
 
 
 def _port_in_use(port: int) -> bool:

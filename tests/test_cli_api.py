@@ -7,6 +7,7 @@ while the running daemon carried on blocking the name.
 
 import errno
 import io
+import sys
 import unittest
 import urllib.error
 from unittest import mock
@@ -115,6 +116,80 @@ class LocalRuleFallbackTests(unittest.TestCase):
             code = cli._local_rule(_config(), "example.com", allow=True)
         self.assertEqual(code, 0)
         application.assert_not_called()
+
+
+class PortConflictMessageTests(unittest.TestCase):
+    """The first thing most installs hit is something already on port 53."""
+
+    def run_with(self, holder):
+        from wifiguard import config as config_module
+
+        error = io.StringIO()
+        app = mock.Mock()
+        app.start.side_effect = OSError("[Errno 98] Address already in use")
+        args = mock.Mock(update=False, no_gateway=True, no_dashboard=True)
+        with mock.patch.object(cli, "_port_holder", return_value=holder):
+            with mock.patch.object(cli, "Application", return_value=app):
+                with mock.patch.object(sys, "stderr", error):
+                    code = cli.command_run(args, config_module.Config())
+        return code, error.getvalue()
+
+    def test_it_names_the_process_holding_the_port(self):
+        code, text = self.run_with("dnsmasq (pid 4021)")
+        self.assertEqual(code, 1)
+        self.assertIn("dnsmasq (pid 4021)", text)
+
+    def test_it_does_not_blame_systemd_resolved_for_another_program(self):
+        _, text = self.run_with("dnsmasq (pid 4021)")
+        self.assertNotIn("systemd-resolved", text)
+        self.assertIn("server.port", text)
+
+    def test_it_gives_the_fix_when_resolved_really_is_the_holder(self):
+        _, text = self.run_with("systemd-resolve (pid 812)")
+        self.assertIn("systemctl disable --now systemd-resolved", text)
+
+    def test_it_still_guesses_when_the_holder_is_unknown(self):
+        _, text = self.run_with("")
+        self.assertIn("most Ubuntu and Debian", text)
+        self.assertIn("systemctl disable --now systemd-resolved", text)
+
+    def test_a_failure_building_the_application_is_a_sentence_not_a_traceback(self):
+        from wifiguard import config as config_module
+
+        error = io.StringIO()
+        args = mock.Mock(update=False, no_gateway=True, no_dashboard=True)
+        with mock.patch.object(cli, "Application", side_effect=OSError("disk is full")):
+            with mock.patch.object(sys, "stderr", error):
+                code = cli.command_run(args, config_module.Config())
+        self.assertEqual(code, 1)
+        self.assertIn("disk is full", error.getvalue())
+
+
+class PortHolderTests(unittest.TestCase):
+    """`ss` output is not something to show a person unedited."""
+
+    def holder(self, line):
+        result = mock.Mock(stdout="State Recv-Q Send-Q Local\n" + line)
+        with mock.patch.object(cli.shutil, "which", return_value="/bin/ss"):
+            with mock.patch("subprocess.run", return_value=result):
+                return cli._port_holder(53)
+
+    def test_program_and_pid_are_extracted(self):
+        self.assertEqual(
+            self.holder('udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:* '
+                        'users:(("systemd-resolve",pid=812,fd=12))'),
+            "systemd-resolve (pid 812)",
+        )
+
+    def test_an_unfamiliar_shape_is_passed_through(self):
+        self.assertEqual(self.holder('udp UNCONN 0 0 :::53 users:(("odd"))'), "odd")
+
+    def test_no_holder_when_nothing_is_listening(self):
+        self.assertEqual(self.holder("udp UNCONN 0 0 0.0.0.0:53 0.0.0.0:*"), "")
+
+    def test_no_holder_without_ss(self):
+        with mock.patch.object(cli.shutil, "which", return_value=None):
+            self.assertEqual(cli._port_holder(53), "")
 
 
 if __name__ == "__main__":

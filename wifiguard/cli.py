@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import sys
@@ -199,8 +200,11 @@ def command_run(args: argparse.Namespace, cfg: Config) -> int:
     if args.update:
         cfg.blocklists.update_on_start = True
 
-    application = Application(cfg)
     try:
+        # Construction reads the blocklists and the persisted cache, so it can
+        # fail on its own; inside the handler, that is a sentence rather than a
+        # traceback.
+        application = Application(cfg)
         application.start(
             with_gateway=not args.no_gateway,
             with_dashboard=not args.no_dashboard,
@@ -216,14 +220,33 @@ def command_run(args: argparse.Namespace, cfg: Config) -> int:
     except OSError as exc:
         print(f"Could not start: {exc}", file=sys.stderr)
         if "Address already in use" in str(exc):
+            # Naming the actual process beats guessing at systemd-resolved,
+            # which is only the usual answer on one family of distributions.
+            holder = _port_holder(cfg.server.port)
             print(
-                "\nSomething else is already on port 53. On Ubuntu that is usually "
-                "systemd-resolved:\n"
-                "  sudo systemctl disable --now systemd-resolved\n"
-                "  sudo rm -f /etc/resolv.conf && echo 'nameserver 127.0.0.1' | "
-                "sudo tee /etc/resolv.conf",
+                f"\nSomething else is already on port {cfg.server.port}"
+                + (f": {holder}" if holder else "")
+                + ".",
                 file=sys.stderr,
             )
+            resolved_fix = (
+                "  sudo systemctl disable --now systemd-resolved\n"
+                "  sudo rm -f /etc/resolv.conf && echo 'nameserver 127.0.0.1' | "
+                "sudo tee /etc/resolv.conf"
+            )
+            if "systemd-resolve" in holder:
+                print(f"\nFree it with:\n{resolved_fix}", file=sys.stderr)
+            elif holder:
+                print(
+                    "Stop it, or set server.port in the config to a free port.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "\nOn most Ubuntu and Debian systems that is systemd-resolved:\n"
+                    + resolved_fix,
+                    file=sys.stderr,
+                )
         return 1
     except Exception as exc:  # noqa: BLE001
         print(f"Could not start: {exc}", file=sys.stderr)
@@ -1152,8 +1175,15 @@ def _port_holder(port: int) -> str:
     except (OSError, subprocess.SubprocessError):
         return ""
     for line in result.stdout.splitlines()[1:]:
-        if "users:" in line:
-            return line.split("users:", 1)[1].strip().strip('()"')
+        if "users:" not in line:
+            continue
+        raw = line.split("users:", 1)[1].strip()
+        # ss prints users:(("systemd-resolve",pid=1,fd=12)); the program name
+        # and pid are the useful part and the rest is noise to read.
+        match = re.search(r'\("([^"]+)",\s*pid=(\d+)', raw)
+        if match:
+            return f"{match.group(1)} (pid {match.group(2)})"
+        return raw.strip('()"')
     return ""
 
 

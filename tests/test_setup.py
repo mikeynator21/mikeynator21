@@ -8,6 +8,7 @@ and does not weaken the install.
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from wifiguard import setupwizard
 from wifiguard.auth import hash_password, is_hashed
@@ -142,6 +143,48 @@ class SecretHandlingTests(unittest.TestCase):
         text = render(answers)
         self.assertNotIn("swordfish", text)
         self.assertIn("scrypt$", text)
+
+
+class NextStepsMatchTheMachineTests(unittest.TestCase):
+    """Termux, containers and WSL are documented targets and have no systemd."""
+
+    def steps(self, systemd, **kwargs):
+        with mock.patch.object(setupwizard, "_systemd_available", return_value=systemd):
+            with mock.patch.object(setupwizard, "_port_in_use", return_value=False):
+                return "\n".join(
+                    setupwizard.next_steps(setupwizard.Answers(**kwargs), Path("/tmp/w.toml"))
+                )
+
+    def test_systemd_present(self):
+        self.assertIn("systemctl enable --now wifiguard", self.steps(True))
+
+    def test_systemd_absent(self):
+        text = self.steps(False)
+        self.assertIn("sudo wifiguard run", text)
+        self.assertNotIn("systemctl enable", text)
+
+    def test_busy_port_advice_without_systemd_does_not_name_systemctl(self):
+        with mock.patch.object(setupwizard, "_systemd_available", return_value=False):
+            with mock.patch.object(setupwizard, "_port_in_use", return_value=True):
+                text = "\n".join(
+                    setupwizard.next_steps(setupwizard.Answers(), Path("/tmp/w.toml"))
+                )
+        self.assertIn("Port 53 is busy", text)
+        self.assertNotIn("systemctl", text)
+
+    def test_busy_port_advice_with_systemd_names_resolved(self):
+        with mock.patch.object(setupwizard, "_systemd_available", return_value=True):
+            with mock.patch.object(setupwizard, "_port_in_use", return_value=True):
+                text = "\n".join(
+                    setupwizard.next_steps(setupwizard.Answers(), Path("/tmp/w.toml"))
+                )
+        self.assertIn("systemd-resolved", text)
+
+    def test_systemd_detection_needs_more_than_the_binary(self):
+        # A container has systemctl on PATH and no systemd behind it.
+        with mock.patch.object(setupwizard.shutil, "which", return_value="/bin/systemctl"):
+            with mock.patch.object(setupwizard.Path, "is_dir", return_value=False):
+                self.assertFalse(setupwizard._systemd_available())
 
 
 if __name__ == "__main__":
