@@ -128,7 +128,7 @@ def upstream_counters() -> dict:
 
 
 def write_config(path: Path, state_dir: Path, upstream: str, *, require_encrypted: bool,
-                 pins: dict | None = None) -> None:
+                 pins: dict | None = None, share_discovery: bool = False) -> None:
     pin_block = ""
     if pins:
         pin_block = "\n[upstream.pins]\n" + "\n".join(
@@ -147,6 +147,7 @@ rate_limit = 0
 [networks]
 discover_local = true
 group_by_network = {{ "{topo.GUEST_NET}" = "guest" }}
+share_discovery = {str(share_discovery).lower()}
 
 [upstream]
 servers = ["{upstream}"]
@@ -191,6 +192,7 @@ class Testbed:
         self.config_path = self.state_dir / "wifiguard.toml"
         self.upstream_process: subprocess.Popen | None = None
         self.gateway_process: subprocess.Popen | None = None
+        self.guest_process: subprocess.Popen | None = None
         self.env = {**os.environ, "PYTHONPATH": str(ROOT), "TESTBED_STATE": str(UPSTREAM_STATE)}
 
     def start_upstream(self) -> None:
@@ -208,14 +210,15 @@ class Testbed:
         raise RuntimeError("the stub internet did not start")
 
     def start_gateway(self, upstream: str, *, require_encrypted: bool, pins=None,
-                      cold_cache: bool = False) -> None:
+                      cold_cache: bool = False, share_discovery: bool = False) -> None:
         self.stop_gateway()
         if cold_cache:
             # The cache is persisted across restarts by design, so a phase that
             # needs to observe a live upstream lookup has to clear it first.
             (self.state_dir / "dnscache.bin").unlink(missing_ok=True)
         write_config(self.config_path, self.state_dir, upstream,
-                     require_encrypted=require_encrypted, pins=pins)
+                     require_encrypted=require_encrypted, pins=pins,
+                     share_discovery=share_discovery)
         self.gateway_process = subprocess.Popen(
             ["ip", "netns", "exec", topo.GATEWAY, "python3",
              str(HERE / "gateway_node.py"), str(self.config_path)],
@@ -232,6 +235,19 @@ class Testbed:
             time.sleep(0.5)
         raise RuntimeError("the gateway did not come up")
 
+    def start_guest_service(self) -> None:
+        """A listener on the guest network, standing in for a printer or a TV."""
+        self.guest_process = subprocess.Popen(
+            ["ip", "netns", "exec", topo.GUEST, "python3", "-c",
+             "import socket\n"
+             "s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+             "s.bind(('0.0.0.0',80));s.listen(8)\n"
+             "while True:\n"
+             "    c,_=s.accept();c.sendall(b'printer');c.close()\n"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env,
+        )
+        time.sleep(0.6)
+
     def stop_gateway(self) -> None:
         if self.gateway_process is not None:
             self.gateway_process.terminate()
@@ -245,6 +261,13 @@ class Testbed:
 
     def stop(self) -> None:
         self.stop_gateway()
+        if self.guest_process is not None:
+            self.guest_process.terminate()
+            try:
+                self.guest_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.guest_process.kill()
+            self.guest_process = None
         if self.upstream_process is not None:
             self.upstream_process.terminate()
             try:
@@ -604,6 +627,106 @@ def scenario_clockless_device(report: Report, testbed: Testbed) -> None:
                      f"mode {answer['mode']}, stratum {answer['stratum']}")
 
 
+def _multicast_probe(listener_ns: str, sender_ns: str, group: str, port: int,
+                     token: str, seconds: float = 4.0) -> dict:
+    """Send multicast on one network and watch for it on another.
+
+    Returns the listener's report. A packet only crosses if something forwards
+    it: multicast is link-local and a router does not pass it on.
+    """
+    import subprocess as sp
+
+    listener = sp.Popen(
+        ["ip", "netns", "exec", listener_ns, "python3", str(HERE / "multicast_peer.py"),
+         "listen", group, str(port), "eth0", str(seconds), token],
+        stdout=sp.PIPE, stderr=sp.STDOUT, text=True,
+    )
+    time.sleep(1.0)  # Let the listener join the group before anything is sent.
+
+    sh(sender_ns, "python3", str(HERE / "multicast_peer.py"),
+       "send", group, str(port), "eth0", token, "6", timeout=15)
+
+    try:
+        output = listener.communicate(timeout=seconds + 10)[0]
+    except sp.TimeoutExpired:
+        listener.kill()
+        output = listener.communicate()[0]
+
+    for line in reversed((output or "").strip().splitlines()):
+        try:
+            return json.loads(line)
+        except ValueError:
+            continue
+    return {"received": 0, "matched": False, "raw": (output or "")[:120]}
+
+
+def scenario_cross_network_discovery(report: Report, testbed: Testbed) -> None:
+    report.heading("Casting and printing across two networks")
+
+    # --- without reflection: the control ---------------------------------
+    testbed.start_gateway(f"udp://{topo.INTERNET_ADDR}", require_encrypted=False,
+                          share_discovery=False)
+
+    before = _multicast_probe(topo.GUEST, topo.PHONE, "224.0.0.251", 5353, "WGT-OFF")
+    report.check(
+        "multicast does not cross on its own",
+        not before.get("matched"),
+        "a router does not forward it, which is why casting across subnets fails",
+    )
+
+    connected, _, error = tcp_probe(topo.PHONE, topo.GUEST_ADDR, 80)
+    report.check("networks are isolated from each other by default", not connected,
+                 error or "CONNECTED")
+
+    # --- with reflection --------------------------------------------------
+    testbed.start_gateway(f"udp://{topo.INTERNET_ADDR}", require_encrypted=False,
+                          share_discovery=True)
+
+    after = _multicast_probe(topo.GUEST, topo.PHONE, "224.0.0.251", 5353, "WGT-MDNS")
+    report.check(
+        "mDNS reaches the other network once reflected",
+        after.get("matched", False),
+        f"{after.get('received', 0)} packets, from {after.get('senders', [])}",
+    )
+    report.check(
+        "the reflection comes from the gateway",
+        topo.GUEST_GATEWAY_ADDR in after.get("senders", []),
+        "re-originated on the far side, not routed",
+    )
+
+    ssdp = _multicast_probe(topo.GUEST, topo.PHONE, "239.255.255.250", 1900, "WGT-SSDP")
+    report.check("SSDP is reflected too", ssdp.get("matched", False),
+                 "DLNA, Roku and UPnP media servers use this")
+
+    # A group nobody asked to reflect must still not cross: the crossing above
+    # has to be the reflector's doing, not some accidental bridging.
+    other = _multicast_probe(topo.GUEST, topo.PHONE, "239.10.20.30", 5354, "WGT-OTHER")
+    report.check(
+        "other multicast groups still do not cross",
+        not other.get("matched"),
+        "only the discovery protocols are forwarded",
+    )
+
+    # --- and the connection that discovery leads to ----------------------
+    connected, elapsed, error = tcp_probe(topo.PHONE, topo.GUEST_ADDR, 80)
+    report.check(
+        "the connection after discovery is allowed",
+        connected,
+        error or f"reached {topo.GUEST_ADDR} in {elapsed:.2f}s",
+    )
+
+    # Sharing two client networks must not open up the network we joined.
+    connected, _, error = tcp_probe(topo.PHONE, topo.INTERNET_ADDR, 80)
+    report.check(
+        "sharing does not expose the joined network",
+        not connected,
+        f"{topo.INTERNET_ADDR}: {error or 'CONNECTED'}",
+    )
+
+    # Put things back for the phases that follow.
+    testbed.start_gateway(f"udp://{topo.INTERNET_ADDR}", require_encrypted=False)
+
+
 def scenario_uplink_change(report: Report, testbed: Testbed) -> None:
     report.heading("The uplink moves (as it does on a laptop)")
 
@@ -658,6 +781,7 @@ def main() -> int:
     try:
         testbed.start_upstream()
         print("stub internet running")
+        testbed.start_guest_service()
         testbed.start_gateway(f"udp://{topo.INTERNET_ADDR}", require_encrypted=False)
         print("gateway running\n")
 
@@ -668,6 +792,7 @@ def main() -> int:
         scenario_bypass(report)
         scenario_routing(report)
         scenario_multi_network(report)
+        scenario_cross_network_discovery(report, testbed)
         scenario_device_compatibility(report, testbed)
         scenario_clockless_device(report, testbed)
         scenario_encrypted_upstream(report, testbed)

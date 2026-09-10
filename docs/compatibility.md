@@ -222,11 +222,39 @@ on this to keep a stable address.
 **Renewals.** A renewing client is answered by unicast to the address it is
 renewing, rather than by broadcast.
 
-**Casting and printing across subnets.** Chromecast, AirPlay and network
-printers rely on multicast discovery, which does not cross between subnets. If
-your TV is on one network and your phone on another, they will not find each
-other — that is a property of mDNS, not of the filter. Put devices that need to
-discover one another on the same network.
+**Casting and printing across subnets.** Chromecast, AirPlay, AirPrint,
+Spotify Connect and network printers are found by multicast, which is
+link-local by design and stops dead at a router. Put the TV on one network and
+the phone on another — a guest SSID, a band that got its own subnet, an IoT
+VLAN — and they never see each other.
+
+WiFiGuard can bridge that gap:
+
+```toml
+[networks]
+share_discovery = true
+```
+
+It reflects mDNS and SSDP between the local networks — receiving discovery
+packets on each and re-sending them on the others — and permits the traffic
+that follows, because finding a printer is no use if the connection to it is
+dropped. This is what `avahi-daemon` calls reflector mode and what enterprise
+gear sells as a "Bonjour gateway".
+
+Off by default, deliberately: it makes two networks less separate, which is the
+opposite of what a guest network is usually for. Turn it on when you want the
+convenience and know what you are trading.
+
+Two things it does not do. The network the gateway *joined* is never included —
+reflecting a hotel's multicast onto your hotspot, or yours onto theirs, is not
+something anyone wants — and only the discovery protocols are forwarded, not
+multicast generally.
+
+```console
+$ wifiguard gateway status
+  discovery sharing  mDNS, SSDP between ap0, gp0
+                     412 packets reflected
+```
 
 ## What is *not* a compatibility problem
 

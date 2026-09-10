@@ -83,6 +83,19 @@ class NetworkSettings:
     #: Map a subnet to a policy group, so the guest SSID can be filtered harder
     #: than the main one.
     group_by_network: dict[str, str] = field(default_factory=dict)
+    #: Reflect mDNS and SSDP between the local networks, and allow the traffic
+    #: that follows, so a phone on one network can cast to a TV or print to a
+    #: printer on another. Multicast stops at a router, so without this they
+    #: never see each other.
+    #:
+    #: Off by default: it deliberately makes two networks less separate, which
+    #: is the opposite of what a guest network is usually for.
+    share_discovery: bool = False
+    #: Which protocols to reflect. Empty means both mDNS and SSDP.
+    discovery_protocols: list[str] = field(default_factory=list)
+    #: Networks to share discovery between. Empty means every local network
+    #: except the one the gateway joined.
+    discovery_networks: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -384,7 +397,19 @@ def _validate(config: Config) -> None:
     if not config.upstream.servers:
         raise ConfigError("upstream.servers must list at least one resolver")
 
-    for network in list(config.networks.extra_networks) + list(config.networks.group_by_network):
+    if config.networks.discovery_protocols:
+        from .gateway.reflector import groups_from_names
+
+        try:
+            groups_from_names(config.networks.discovery_protocols)
+        except ValueError as exc:
+            raise ConfigError(f"networks.discovery_protocols: {exc}") from exc
+
+    for network in (
+        list(config.networks.extra_networks)
+        + list(config.networks.group_by_network)
+        + list(config.networks.discovery_networks)
+    ):
         try:
             ipaddress.ip_network(network, strict=False)
         except ValueError as exc:
@@ -537,6 +562,13 @@ refresh_hours = 168
 block_doh_bypass = true
 allow = ["captive.apple.com", "connectivitycheck.gstatic.com"]
 block = []
+
+[networks]
+# Reflect mDNS and SSDP between your local networks, so a phone on one can cast
+# to a TV or print to a printer on another. Multicast stops at a router, so
+# without this they never find each other. Off by default: it makes two
+# networks less separate, which is the opposite of what a guest network is for.
+# share_discovery = true
 
 [compatibility]
 # Services devices break without -- time, certificate status, connectivity

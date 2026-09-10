@@ -44,7 +44,8 @@ gets abandoned because it breaks something. See
 
 **Covers every network on your router.** A modem with a 2.4GHz SSID, a 5GHz
 SSID, a guest network and a wired LAN is often four subnets. All of them are
-discovered and served.
+discovered and served — and with `share_discovery = true`, casting and printing
+work *between* them, which multicast alone cannot do.
 
 **Travels.** Your laptop becomes a filtering travel router; your phone stays
 filtered anywhere over WireGuard.
@@ -251,9 +252,9 @@ Worked examples are in [deploy/examples/](deploy/examples/).
 Three layers, each proving something the one below it cannot.
 
 ```bash
-python3 -m unittest discover -s tests -v      # 270 unit tests, no network needed
+python3 -m unittest discover -s tests -v      # 288 unit tests, no network needed
 wifiguard selftest                            # 55 checks, the real stack on loopback
-sudo ./tests/integration/run.sh               # 58 checks on a virtual network
+sudo ./tests/integration/run.sh               # 66 checks on a virtual network
 ```
 
 **Unit tests** cover the pieces. X25519 is checked against the RFC 7748
@@ -272,7 +273,8 @@ It is what proves the claims that only hold once a kernel is involved: that a
 device with a hardcoded `8.8.8.8` is answered by us anyway, that DNS-over-TLS
 is refused in milliseconds, that a client can route *through* the network you
 joined without reaching hosts *on* it, that a device with no clock can get the
-time, and that a blocklist cannot take that away. See
+time, that a blocklist cannot take that away, and that multicast discovery
+crosses between two subnets only when reflection is switched on. See
 [tests/integration/README.md](tests/integration/README.md), including the two
 real bugs it caught that the unit tests could not.
 

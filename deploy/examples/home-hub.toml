@@ -26,6 +26,11 @@ extra_networks = []
 # Filter the guest network harder than the main one.
 # group_by_network = { "192.168.4.0/24" = "guest" }
 
+# Let devices on different networks find each other -- casting from a phone on
+# one SSID to a TV on another, printing from anywhere. Multicast cannot cross a
+# router on its own. Off by default because it makes the networks less separate.
+# share_discovery = true
+
 [upstream]
 servers = [
     "https://dns.quad9.net/dns-query",

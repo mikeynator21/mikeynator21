@@ -24,6 +24,7 @@ from ..config import Config
 from . import firewall, interfaces, networks
 from .dhcp import DHCPConfig, DHCPServer
 from .hotspot import Hotspot, HotspotConfig, pick_channel
+from .reflector import MulticastReflector, groups_from_names
 from .timeserver import TimeServer
 
 log = logging.getLogger(__name__)
@@ -74,6 +75,7 @@ class GatewayManager:
         self.hotspot: Hotspot | None = None
         self.dhcp: DHCPServer | None = None
         self.time_server: TimeServer | None = None
+        self.reflector: MulticastReflector | None = None
         self._watcher: threading.Thread | None = None
         self._stop = threading.Event()
         self._lock = threading.RLock()
@@ -185,6 +187,9 @@ class GatewayManager:
             self.time_server = TimeServer(router_address, interface=ap_interface)
             self.time_server.start()
 
+        if self.config.networks.share_discovery:
+            self._start_reflector(ap_interface, uplink)
+
         firewall.enable_forwarding(ipv6=settings.allow_ipv6)
         self._apply_rules(uplink)
 
@@ -222,6 +227,9 @@ class GatewayManager:
         if self._watcher is not None:
             self._watcher.join(timeout=UPLINK_POLL_SECONDS + 2)
             self._watcher = None
+        if self.reflector is not None:
+            self.reflector.stop()
+            self.reflector = None
         if self.time_server is not None:
             self.time_server.stop()
             self.time_server = None
@@ -262,6 +270,7 @@ class GatewayManager:
             allow_ipv6=settings.allow_ipv6,
             isolate_from_uplink=settings.isolate_from_uplink,
             uplink_subnet=self._uplink_subnet(uplink),
+            shared_networks=self._shared_networks(uplink),
         )
         firewall.apply_rules(rules)
 
@@ -270,6 +279,60 @@ class GatewayManager:
             self.state.uplink_fingerprint = interfaces.uplink_fingerprint()
             self.state.rules_applied = True
             self.state.vpn_interface = vpn_interface or ""
+
+    def _discovery_networks(self, uplink: str) -> list:
+        """The local networks discovery should be shared between.
+
+        The uplink is never included: reflecting a cafe's multicast onto the
+        hotspot, or the hotspot's onto the cafe, is not something anyone wants.
+        """
+        candidates = [
+            local for local in networks.discover_local_networks()
+            if not local.is_uplink and local.interface != uplink
+        ]
+        wanted = set(self.config.networks.discovery_networks)
+        if wanted:
+            candidates = [local for local in candidates if str(local.network) in wanted]
+        return candidates
+
+    def _start_reflector(self, ap_interface: str, uplink: str) -> None:
+        local = self._discovery_networks(uplink)
+        interfaces_in_play = list(dict.fromkeys(
+            [ap_interface] + [item.interface for item in local]
+        ))
+        if len(interfaces_in_play) < 2:
+            log.info(
+                "discovery sharing is on, but there is only one client network "
+                "(%s) -- there is nothing to reflect between",
+                ", ".join(interfaces_in_play) or "none",
+            )
+            return
+
+        try:
+            groups = groups_from_names(self.config.networks.discovery_protocols)
+        except ValueError as exc:
+            log.error("discovery reflection not started: %s", exc)
+            return
+
+        own = {item.address for item in local}
+        if self.state.subnet is not None:
+            own.add(str(next(self.state.subnet.hosts())))
+
+        self.reflector = MulticastReflector(
+            interfaces_in_play, groups=groups, own_addresses=own
+        )
+        self.reflector.start()
+
+    def _shared_networks(self, uplink: str) -> list[str]:
+        """Subnets allowed to reach each other, when discovery is shared."""
+        if not self.config.networks.share_discovery or self.state.subnet is None:
+            return []
+        shared = [str(self.state.subnet)]
+        for local in self._discovery_networks(uplink):
+            entry = str(local.network)
+            if entry not in shared:
+                shared.append(entry)
+        return shared if len(shared) > 1 else []
 
     def _client_mtu(self) -> int:
         """The MTU to advertise to clients.
@@ -374,6 +437,7 @@ class GatewayManager:
         payload["forwarding_enabled"] = firewall.forwarding_enabled()
         payload["ssid"] = self.config.hotspot.ssid
         payload["time_server"] = self.time_server.status() if self.time_server else {"running": False}
+        payload["discovery"] = self.reflector.status() if self.reflector else {"running": False}
         return payload
 
     def describe_rules(self) -> str:

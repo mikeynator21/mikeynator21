@@ -93,6 +93,21 @@ dig @192.168.1.10 ads.doubleclick.net +short
 # 0.0.0.0  -> filtered
 ```
 
+## Casting and printing between them
+
+Devices on separate subnets cannot discover each other, because multicast does
+not cross a router. If you want the phone on one network to cast to the TV on
+another:
+
+```toml
+[networks]
+share_discovery = true
+```
+
+That reflects mDNS and SSDP between the local networks and allows the traffic
+that follows. It is off by default because it makes the networks less separate.
+See [compatibility.md](compatibility.md#other-things-that-trip-devices-up).
+
 ## VPN peers reach all of them
 
 With `route_to_vpn_peers = true` (the default), peers on the `lan` profile get

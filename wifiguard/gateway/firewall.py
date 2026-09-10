@@ -81,6 +81,10 @@ class GatewayRules:
     #: The uplink's own subnet, e.g. "192.168.1.0/24". Discovered at run time,
     #: because it changes every time the gateway joins a different network.
     uplink_subnet: str = ""
+    #: Client networks permitted to reach each other, so a phone on one can
+    #: cast to a TV on another. Deliberately explicit: this makes two networks
+    #: less separate, which is the opposite of what a guest network is for.
+    shared_networks: list[str] = field(default_factory=list)
     #: Forward IPv6 for clients. Off by default: an unfiltered v6 path defeats
     #: the point of the gateway.
     allow_ipv6: bool = False
@@ -144,6 +148,17 @@ def build_ruleset(rules: GatewayRules) -> str:
         iifname "{ap}" ip daddr {rules.uplink_subnet} drop
 """
 
+    shared_rules = ""
+    if len(rules.shared_networks) > 1:
+        members = ", ".join(rules.shared_networks)
+        shared_rules = f"""
+        # Networks allowed to reach one another, so discovery leads somewhere:
+        # finding a printer or a TV is no use if the connection that follows is
+        # dropped. Placed after the isolation rule above, so the network the
+        # gateway joined is never opened up by this.
+        ip saddr {{ {members} }} ip daddr {{ {members} }} accept
+"""
+
     if rules.allow_ipv6:
         ipv6_forward = f'        iifname "{ap}" oifname "{uplink}" accept'
     else:
@@ -187,6 +202,12 @@ table inet {FILTER_TABLE} {{
         iifname "{ap}" udp dport {{ 53, 67 }} accept
         iifname "{ap}" tcp dport {rules.dns_port} accept
         iifname "{ap}" icmp type {{ echo-request, destination-unreachable }} accept
+
+        # Discovery traffic, which the reflector picks up and re-sends on the
+        # other networks. Harmless to accept even when reflection is off: these
+        # are link-local groups that never leave the segment.
+        ip daddr {{ 224.0.0.251, 239.255.255.250 }} accept
+        ip6 daddr {{ ff02::fb, ff02::c }} accept
 {dashboard_rules}
 
         # The dashboard and resolver must never be reachable from the network
@@ -200,7 +221,7 @@ table inet {FILTER_TABLE} {{
 
         ct state established,related accept
         ct state invalid drop
-{bypass_rules}{isolation_rules}
+{bypass_rules}{isolation_rules}{shared_rules}
         # Clients reach the internet only through the intended uplink. With a
         # VPN configured that is the tunnel, so a tunnel that goes down takes
         # client connectivity with it rather than leaking in the clear.

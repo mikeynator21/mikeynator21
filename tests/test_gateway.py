@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 from wifiguard.cluster import Cluster, ClusterConfig, IdleMonitor, NodeState
-from wifiguard.gateway import firewall, hotspot, networks
+from wifiguard.gateway import firewall, hotspot, networks, reflector
 from wifiguard.gateway.dhcp import DHCPConfig, DHCPServer, parse_packet
 from wifiguard.server import RateLimiter
 
@@ -193,6 +193,122 @@ class RulesetSyntaxTests(unittest.TestCase):
         self.assertIn("type nat hook postrouting priority srcnat", text)
         self.assertNotIn("hook srcnat", text)
         self.assertNotIn("hook dstnat", text)
+
+
+class SharedNetworkTests(unittest.TestCase):
+    """Letting two client networks reach each other, for casting and printing."""
+
+    def rules(self, **overrides):
+        settings = dict(
+            ap_interface="wlan1", uplink_interface="wlan0", subnet=SUBNET,
+            uplink_subnet="192.168.1.0/24",
+        )
+        settings.update(overrides)
+        return firewall.build_ruleset(firewall.GatewayRules(**settings))
+
+    def test_no_sharing_by_default(self):
+        self.assertNotIn("ip saddr {", self.rules().split("chain forward")[1])
+
+    def test_sharing_accepts_between_the_named_networks(self):
+        text = self.rules(shared_networks=["10.42.7.0/24", "10.60.0.0/24"])
+        self.assertIn(
+            "ip saddr { 10.42.7.0/24, 10.60.0.0/24 } "
+            "ip daddr { 10.42.7.0/24, 10.60.0.0/24 } accept",
+            text,
+        )
+
+    def test_a_single_network_shares_with_nothing(self):
+        # Sharing needs two sides; one network on its own is a no-op.
+        self.assertNotIn("ip saddr {", self.rules(shared_networks=["10.42.7.0/24"]).split("chain forward")[1])
+
+    def test_sharing_does_not_override_uplink_isolation(self):
+        """The joined network must stay off-limits even when sharing is on."""
+        forward = self.rules(shared_networks=["10.42.7.0/24", "10.60.0.0/24"]).split("chain forward")[1]
+        isolation_at = forward.index("ip daddr 192.168.1.0/24 drop")
+        sharing_at = forward.index("ip saddr { 10.42.7.0/24")
+        self.assertLess(isolation_at, sharing_at)
+
+    def test_discovery_traffic_is_accepted_on_input(self):
+        text = self.rules()
+        self.assertIn("224.0.0.251", text)
+        self.assertIn("239.255.255.250", text)
+
+    def test_ruleset_with_sharing_is_valid(self):
+        if shutil.which("nft") is None:
+            self.skipTest("nft is not installed")
+        result = subprocess.run(
+            ["nft", "-c", "-f", "-"],
+            input=self.rules(shared_networks=["10.42.7.0/24", "10.60.0.0/24"], allow_ipv6=True),
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        if result.returncode != 0 and "not permitted" in result.stderr:
+            self.skipTest("nft check mode needs privileges here")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class ReflectorTests(unittest.TestCase):
+    def test_default_groups_cover_the_common_protocols(self):
+        names = {group.name for group in reflector.DEFAULT_GROUPS}
+        self.assertEqual(names, {"mDNS", "SSDP"})
+
+    def test_mdns_uses_the_required_ttl(self):
+        # RFC 6762 requires 255, and receivers may reject anything lower.
+        self.assertEqual(reflector.MDNS.ttl, 255)
+        self.assertEqual(reflector.MDNS.address, "224.0.0.251")
+        self.assertEqual(reflector.MDNS.port, 5353)
+
+    def test_ssdp_group(self):
+        self.assertEqual(reflector.SSDP.address, "239.255.255.250")
+        self.assertEqual(reflector.SSDP.port, 1900)
+
+    def test_groups_from_names(self):
+        self.assertEqual(reflector.groups_from_names(["mdns"]), (reflector.MDNS,))
+        self.assertEqual(reflector.groups_from_names([]), reflector.DEFAULT_GROUPS)
+
+    def test_unknown_protocol_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            reflector.groups_from_names(["bonjour"])
+        self.assertIn("bonjour", str(ctx.exception))
+
+    def test_one_interface_is_not_started(self):
+        instance = reflector.MulticastReflector(["wlan1"])
+        instance.start()
+        self.assertFalse(instance.running)
+
+    def test_duplicate_interfaces_are_collapsed(self):
+        instance = reflector.MulticastReflector(["wlan1", "wlan1", "eth0"])
+        self.assertEqual(instance.interfaces, ["wlan1", "eth0"])
+
+    def test_packets_from_ourselves_are_not_reflected(self):
+        """This is what stops a reflection being reflected back for ever."""
+        instance = reflector.MulticastReflector(
+            ["a", "b"], own_addresses={"10.42.7.1", "10.60.0.1"}
+        )
+        instance._reflect(reflector.MDNS, "a", b"payload", "10.60.0.1")
+        self.assertEqual(instance.stats.self_originated, 1)
+        self.assertEqual(instance.stats.reflected, 0)
+
+    def test_a_repeated_packet_is_only_reflected_once(self):
+        instance = reflector.MulticastReflector(["a", "b"])
+        self.assertFalse(instance._already_seen(reflector.MDNS, b"hello"))
+        self.assertTrue(instance._already_seen(reflector.MDNS, b"hello"))
+
+    def test_the_same_bytes_on_another_protocol_are_distinct(self):
+        instance = reflector.MulticastReflector(["a", "b"])
+        instance._already_seen(reflector.MDNS, b"hello")
+        self.assertFalse(instance._already_seen(reflector.SSDP, b"hello"))
+
+    def test_the_digest_cache_is_bounded(self):
+        instance = reflector.MulticastReflector(["a", "b"])
+        for index in range(5000):
+            instance._already_seen(reflector.MDNS, str(index).encode())
+        self.assertLessEqual(len(instance._seen), 4096)
+
+    def test_status_reports_what_is_covered(self):
+        status = reflector.MulticastReflector(["a", "b"]).status()
+        self.assertFalse(status["running"])
+        self.assertEqual(status["interfaces"], ["a", "b"])
+        self.assertTrue(all(group["covers"] for group in status["groups"]))
 
 
 class HotspotConfigTests(unittest.TestCase):

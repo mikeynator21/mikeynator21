@@ -21,11 +21,14 @@ from wifiguard import config as config_module  # noqa: E402
 from wifiguard.app import Application  # noqa: E402
 from wifiguard.gateway import firewall  # noqa: E402
 from wifiguard.gateway.dhcp import DHCPConfig, DHCPServer  # noqa: E402
+from wifiguard.gateway.reflector import MulticastReflector  # noqa: E402
 from wifiguard.gateway.timeserver import TimeServer  # noqa: E402
 
 AP_INTERFACE = "ap0"
 UPLINK_INTERFACE = "up0"
+GUEST_INTERFACE = "gp0"
 AP_SUBNET = ipaddress.ip_network("10.42.7.0/24")
+GUEST_SUBNET = ipaddress.ip_network("10.60.0.0/24")
 
 
 def _uplink_subnet() -> str:
@@ -63,6 +66,11 @@ def main() -> int:
         dashboard_port=cfg.dashboard.port,
         isolate_from_uplink=cfg.hotspot.isolate_from_uplink,
         uplink_subnet=_uplink_subnet(),
+        shared_networks=(
+            [str(AP_SUBNET), str(GUEST_SUBNET)]
+            if cfg.networks.share_discovery
+            else []
+        ),
     )
     firewall.apply_rules(rules)
     log.info("firewall applied")
@@ -103,6 +111,8 @@ def main() -> int:
     def shutdown(signum, _frame):
         log.info("stopping")
         stopping.set()
+        if reflector is not None:
+            reflector.stop()
         time_server.stop()
         dhcp.stop()
         application.stop()
@@ -111,6 +121,17 @@ def main() -> int:
 
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
+
+    reflector = None
+    if cfg.networks.share_discovery:
+        reflector = MulticastReflector(
+            [AP_INTERFACE, GUEST_INTERFACE],
+            own_addresses={
+                str(next(AP_SUBNET.hosts())),
+                str(next(GUEST_SUBNET.hosts())),
+            },
+        )
+        reflector.start()
 
     print("GATEWAY READY", flush=True)
     signal.pause()

@@ -549,6 +549,17 @@ def command_gateway(args: argparse.Namespace, cfg: Config) -> int:
     print(f"  ip forwarding   {'on' if firewall.forwarding_enabled() else 'off'}")
     print(f"  rules loaded    {'yes' if firewall.rules_installed() else 'no'}")
     print(f"  fingerprint     {interfaces.uplink_fingerprint()}")
+
+    if cfg.networks.share_discovery:
+        from .gateway.reflector import groups_from_names
+
+        protocols = ", ".join(
+            group.name for group in groups_from_names(cfg.networks.discovery_protocols)
+        )
+        print(f"  discovery       sharing {protocols} between local networks")
+    else:
+        print("  discovery       not shared (devices on different networks "
+              "cannot find each other)")
     print()
     print("  interfaces")
     for interface in interfaces.list_interfaces():
