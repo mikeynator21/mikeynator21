@@ -136,6 +136,9 @@ class SourceStats:
     updated_at: float = 0.0
     error: str = ""
     from_cache: bool = False
+    #: Set when a download was rejected as implausible and the previous copy
+    #: was kept instead.
+    rejected: str = ""
 
 
 @dataclass
@@ -144,6 +147,8 @@ class ParseResult:
     allow: DomainSet = field(default_factory=DomainSet)
     lines_read: int = 0
     lines_skipped: int = 0
+    #: Exception rules seen in a source that is not trusted to write them.
+    allow_rules_ignored: int = 0
 
 
 def parse_rules(
@@ -151,6 +156,7 @@ def parse_rules(
     source: str,
     *,
     hosts_match_subdomains: bool = True,
+    trust_allow_rules: bool = False,
     into: ParseResult | None = None,
 ) -> ParseResult:
     """Parse any supported list format into block/allow rules.
@@ -159,6 +165,12 @@ def parse_rules(
     a plain list) also blocks everything beneath it.  Curated lists name base
     tracker domains and expect subdomains to fall with them, so this defaults to
     on; turning it off makes such entries match the exact name only.
+
+    `trust_allow_rules` decides whether ``@@||domain^`` exception rules in the
+    source are honoured.  Off for downloaded lists: an allow rule silently
+    switches protection off for a name, so a compromised or hijacked list
+    source could un-block whatever it liked and nothing would look wrong.
+    Allowlisting stays a local decision.
     """
     result = into if into is not None else ParseResult()
 
@@ -177,7 +189,7 @@ def parse_rules(
             if not line:
                 continue
 
-        if _consume_rule(line, source, result, hosts_match_subdomains):
+        if _consume_rule(line, source, result, hosts_match_subdomains, trust_allow_rules):
             continue
         result.lines_skipped += 1
 
@@ -185,11 +197,21 @@ def parse_rules(
 
 
 def _consume_rule(
-    line: str, source: str, result: ParseResult, hosts_match_subdomains: bool
+    line: str,
+    source: str,
+    result: ParseResult,
+    hosts_match_subdomains: bool,
+    trust_allow_rules: bool = False,
 ) -> bool:
     """Apply one already-trimmed line. Returns False if it isn't a usable rule."""
     allow_match = _ADBLOCK_ALLOW.match(line)
     if allow_match:
+        if not trust_allow_rules:
+            # Recognised and deliberately ignored, so it is not counted as
+            # garbage. See parse_rules for why a download does not get to
+            # decide what stays unfiltered.
+            result.allow_rules_ignored += 1
+            return True
         domain = _normalise(allow_match.group(1))
         if domain:
             result.allow.add_suffix(domain, source)
@@ -247,6 +269,19 @@ def _consume_rule(
     return False
 
 
+def _merge(target: ParseResult, extra: ParseResult) -> None:
+    """Fold one parse result into another."""
+    target.block.exact.update(extra.block.exact)
+    target.block.suffix.update(extra.block.suffix)
+    target.block.regex.extend(extra.block.regex)
+    target.allow.exact.update(extra.allow.exact)
+    target.allow.suffix.update(extra.allow.suffix)
+    target.allow.regex.extend(extra.allow.regex)
+    target.lines_read += extra.lines_read
+    target.lines_skipped += extra.lines_skipped
+    target.allow_rules_ignored += extra.allow_rules_ignored
+
+
 def _add_domain(target: DomainSet, domain: str, source: str, as_suffix: bool) -> None:
     if as_suffix:
         target.add_suffix(domain, source)
@@ -290,8 +325,17 @@ class BlocklistManager:
         cache_dir: str | os.PathLike[str],
         *,
         hosts_match_subdomains: bool = True,
+        trust_remote_allow_rules: bool = False,
+        collapse_threshold: float = 0.5,
     ) -> None:
         self.cache_dir = Path(cache_dir)
+        #: Honour @@|| exception rules found in downloaded lists.
+        self.trust_remote_allow_rules = trust_remote_allow_rules
+        #: Refuse an update that drops a source below this fraction of the
+        #: rule count it had last time. A list that suddenly loses most of its
+        #: rules is a broken source or a hijacked one; either way the previous
+        #: copy is better than the new one.
+        self.collapse_threshold = collapse_threshold
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.hosts_match_subdomains = hosts_match_subdomains
 
@@ -300,6 +344,7 @@ class BlocklistManager:
         self.sources: dict[str, SourceStats] = {}
         self.last_update: float = 0.0
         self._validator_cache: dict[str, dict[str, str]] | None = None
+        self._rule_counts: dict[str, int] = self._load_rule_counts()
 
     @property
     def rule_count(self) -> int:
@@ -339,17 +384,53 @@ class BlocklistManager:
                 sources[url] = stats
                 continue
 
-            before = len(result.block) + len(result.allow)
-            parse_rules(
+            # Parse into a scratch result first, so an implausible source can
+            # be rejected without having already polluted the live rule sets.
+            scratch = parse_rules(
                 text,
                 source=url,
                 hosts_match_subdomains=self.hosts_match_subdomains,
-                into=result,
+                trust_allow_rules=self.trust_remote_allow_rules,
             )
-            stats.rules = len(result.block) + len(result.allow) - before
+            produced = len(scratch.block) + len(scratch.allow)
+            previous = self._rule_counts.get(url, 0)
+
+            if self._has_collapsed(url, produced, previous):
+                stats.rejected = (
+                    f"produced {produced} rules, down from {previous} last time"
+                )
+                stats.rules = previous
+                log.error(
+                    "refusing the update to %s: %s. Keeping the previous rules. "
+                    "Either the source is broken or it is not the source you "
+                    "think it is.",
+                    url, stats.rejected,
+                )
+                cached = self._cached_text(url)
+                if cached is None:
+                    sources[url] = stats
+                    continue
+                scratch = parse_rules(
+                    cached,
+                    source=url,
+                    hosts_match_subdomains=self.hosts_match_subdomains,
+                    trust_allow_rules=self.trust_remote_allow_rules,
+                )
+                produced = len(scratch.block) + len(scratch.allow)
+            else:
+                self._rule_counts[url] = produced
+
+            _merge(result, scratch)
+            stats.rules = produced
             stats.from_cache = from_cache
             stats.updated_at = fetched_at
             sources[url] = stats
+            if scratch.allow_rules_ignored:
+                log.info(
+                    "%s: ignored %d exception rules -- a downloaded list does not "
+                    "get to decide what stays unfiltered",
+                    url, scratch.allow_rules_ignored,
+                )
             log.info("blocklist %s: %d rules%s", url, stats.rules, " (cached)" if from_cache else "")
 
         for entry in extra_block:
@@ -367,12 +448,49 @@ class BlocklistManager:
         self.allow = result.allow
         self.sources = sources
         self.last_update = time.time()
+        self._save_rule_counts()
         log.info(
             "blocklists compiled: %d block rules, %d allow rules from %d sources",
             len(self.block),
             len(self.allow),
             len(sources),
         )
+
+    def _has_collapsed(self, url: str, produced: int, previous: int) -> bool:
+        """Whether an update lost so many rules it should not be trusted.
+
+        Only downloads are judged. A local file that shrinks is its owner
+        editing it, which is not something to second-guess.
+        """
+        if not url.startswith(("http://", "https://")):
+            return False
+        if previous < 1000:
+            # Too small a baseline to judge; a short list is legitimately short.
+            return False
+        return produced < previous * self.collapse_threshold
+
+    def _cached_text(self, url: str) -> str | None:
+        path = self._cache_path(url)
+        if not path.exists():
+            return None
+        try:
+            return gzip.decompress(path.read_bytes()).decode("utf-8", errors="replace")
+        except (OSError, gzip.BadGzipFile):
+            return None
+
+    def _load_rule_counts(self) -> dict[str, int]:
+        path = self.cache_dir / "rule-counts.json"
+        try:
+            return {k: int(v) for k, v in json.loads(path.read_text(encoding="utf-8")).items()}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _save_rule_counts(self) -> None:
+        path = self.cache_dir / "rule-counts.json"
+        try:
+            path.write_text(json.dumps(self._rule_counts), encoding="utf-8")
+        except OSError as exc:  # pragma: no cover
+            log.warning("could not persist blocklist rule counts: %s", exc)
 
     def _cache_path(self, url: str) -> Path:
         digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]

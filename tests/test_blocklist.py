@@ -87,10 +87,25 @@ class ParseTests(unittest.TestCase):
         self.assertFalse(result.block.match("localhost"))
         self.assertFalse(result.block.match("ip6-localhost"))
 
-    def test_adblock_syntax(self):
-        result = parse_rules("||ads.example.com^\n@@||good.example.com^", "test")
+    def test_adblock_block_syntax(self):
+        result = parse_rules("||ads.example.com^", "test")
         self.assertTrue(result.block.match("sub.ads.example.com"))
+
+    def test_exception_rules_are_ignored_by_default(self):
+        """A downloaded list does not get to decide what stays unfiltered.
+
+        An @@|| rule silently switches protection off for a name, so honouring
+        one from a source that could be hijacked would let it un-block whatever
+        it liked with nothing looking wrong.
+        """
+        result = parse_rules("||ads.example.com^\n@@||malware.example^", "test")
+        self.assertFalse(result.allow.match("malware.example"))
+        self.assertEqual(result.allow_rules_ignored, 1)
+
+    def test_exception_rules_honoured_when_trusted(self):
+        result = parse_rules("@@||good.example.com^", "test", trust_allow_rules=True)
         self.assertTrue(result.allow.match("good.example.com"))
+        self.assertEqual(result.allow_rules_ignored, 0)
 
     def test_plain_domain_list(self):
         result = parse_rules("tracker.example\nanalytics.example", "test")
@@ -169,6 +184,37 @@ class ManagerTests(unittest.TestCase):
         stats = next(iter(manager.sources.values()))
         self.assertTrue(stats.error)
         self.assertEqual(manager.rule_count, 0)
+
+    def test_a_collapsed_download_is_refused(self):
+        """A list that loses most of its rules is broken or hijacked."""
+        manager = BlocklistManager(self.root / "cache")
+        # 5000 rules previously, 3 now: far below the threshold.
+        self.assertTrue(manager._has_collapsed("https://list.example/hosts", 3, 5000))
+
+    def test_a_normal_download_is_accepted(self):
+        manager = BlocklistManager(self.root / "cache")
+        self.assertFalse(manager._has_collapsed("https://list.example/hosts", 4800, 5000))
+
+    def test_a_small_list_is_not_judged(self):
+        # Too small a baseline to tell a collapse from a legitimately short list.
+        manager = BlocklistManager(self.root / "cache")
+        self.assertFalse(manager._has_collapsed("https://list.example/hosts", 2, 40))
+
+    def test_a_local_file_is_never_judged(self):
+        # Shrinking a file on disk is its owner editing it.
+        manager = BlocklistManager(self.root / "cache")
+        self.assertFalse(manager._has_collapsed("/etc/wifiguard/mylist.txt", 3, 5000))
+
+    def test_the_check_can_be_disabled(self):
+        manager = BlocklistManager(self.root / "cache", collapse_threshold=0.0)
+        self.assertFalse(manager._has_collapsed("https://list.example/hosts", 3, 5000))
+
+    def test_a_collapsed_source_keeps_the_previous_rules(self):
+        source = self.root / "list.txt"
+        source.write_text("\n".join(f"0.0.0.0 h{i}.example.com" for i in range(2000)))
+        manager = BlocklistManager(self.root / "cache")
+        manager.load([str(source)])
+        self.assertEqual(manager.rule_count, 2000)
 
     def test_doh_bypass_list_is_substantial(self):
         self.assertGreater(len(blocklist.DOH_BOOTSTRAP_DOMAINS), 30)

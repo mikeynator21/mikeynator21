@@ -25,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, TYPE_CHECKING
 
+from .auth import AttemptLimiter, is_hashed, looks_local, verify_password
 from .vpn import qr
 from .vpn.wireguard import WireGuardError
 
@@ -45,6 +46,7 @@ class Dashboard:
         self.config = application.config.dashboard
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._limiter = AttemptLimiter()
 
     def start(self) -> None:
         handler = _make_handler(self)
@@ -61,12 +63,18 @@ class Dashboard:
         )
         self._thread.start()
 
-        if self.config.address not in ("127.0.0.1", "::1", "localhost") and not self.config.password:
+        if not looks_local(self.config.address) and not self.config.password:
+            # Configuration validation refuses this unless it was opted into,
+            # so reaching here means the operator asked for it explicitly.
             log.warning(
-                "the dashboard is reachable from the network at %s:%d with no password set. "
-                "Set dashboard.password, or bind it to 127.0.0.1.",
-                self.config.address,
-                self.config.port,
+                "the dashboard is reachable from the network at %s:%d with NO PASSWORD. "
+                "Anyone who can reach it can switch filtering off or add a VPN peer.",
+                self.config.address, self.config.port,
+            )
+        elif self.config.password and not is_hashed(self.config.password):
+            log.warning(
+                "dashboard.password is stored in the clear. Replace it with a hash: "
+                "run `wifiguard passwd` and paste the result into the config."
             )
         log.info("dashboard on http://%s:%d", self.config.address, self.config.port)
 
@@ -81,23 +89,27 @@ class Dashboard:
 
     # -- authentication ---------------------------------------------------
 
-    def authorised(self, header: str | None) -> bool:
+    def authorised(self, header: str | None, client: str = "") -> tuple[bool, str]:
+        """Check credentials. Returns (allowed, reason-if-not)."""
         if not self.config.password:
-            return True
-        if not header:
-            return False
-        try:
-            scheme, _, value = header.partition(" ")
-            if scheme.lower() == "basic":
-                decoded = base64.b64decode(value).decode("utf-8")
-                _, _, supplied = decoded.partition(":")
-            elif scheme.lower() == "bearer":
-                supplied = value
-            else:
-                return False
-        except (ValueError, UnicodeDecodeError):
-            return False
-        return hmac.compare_digest(supplied, self.config.password)
+            return True, ""
+
+        remaining = self._limiter.locked_out(client) if client else 0.0
+        if remaining:
+            return False, f"too many failed attempts; try again in {int(remaining)}s"
+
+        supplied = _extract_credential(header)
+        if supplied is None:
+            return False, "authentication required"
+
+        if verify_password(supplied, self.config.password):
+            if client:
+                self._limiter.record_success(client)
+            return True, ""
+
+        if client and self._limiter.record_failure(client):
+            log.warning("locking out %s after repeated failed dashboard logins", client)
+        return False, "authentication required"
 
 
 def _make_handler(dashboard: Dashboard) -> type[BaseHTTPRequestHandler]:
@@ -165,13 +177,35 @@ def _make_handler(dashboard: Dashboard) -> type[BaseHTTPRequestHandler]:
             if write and dashboard.config.readonly:
                 self._error(HTTPStatus.FORBIDDEN, "the dashboard is in read-only mode")
                 return False
-            if dashboard.authorised(self.headers.get("Authorization")):
-                return True
-            self._send(
-                HTTPStatus.UNAUTHORIZED,
-                json.dumps({"error": "authentication required"}).encode(),
-                extra={"WWW-Authenticate": 'Basic realm="WiFiGuard"'},
+
+            if write:
+                # A state-changing request must be JSON. A browser cannot send
+                # this content type cross-origin without a CORS preflight,
+                # which nothing here answers -- so a page on the local network
+                # cannot make a logged-in browser change settings on its behalf.
+                content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip()
+                if content_type != "application/json":
+                    self._error(
+                        HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                        "writes must be sent as application/json",
+                    )
+                    return False
+
+            allowed, reason = dashboard.authorised(
+                self.headers.get("Authorization"), self.client_address[0]
             )
+            if allowed:
+                return True
+
+            status = (
+                HTTPStatus.TOO_MANY_REQUESTS
+                if "failed attempts" in reason
+                else HTTPStatus.UNAUTHORIZED
+            )
+            extra = {} if status == HTTPStatus.TOO_MANY_REQUESTS else {
+                "WWW-Authenticate": 'Basic realm="WiFiGuard"'
+            }
+            self._send(status, json.dumps({"error": reason}).encode(), extra=extra)
             return False
 
         # -- routing ------------------------------------------------------
@@ -437,6 +471,23 @@ def _make_handler(dashboard: Dashboard) -> type[BaseHTTPRequestHandler]:
                 log.warning("could not reload the WireGuard interface: %s", exc)
 
     return Handler
+
+
+def _extract_credential(header: str | None) -> str | None:
+    """Pull the secret out of a Basic or Bearer authorization header."""
+    if not header:
+        return None
+    try:
+        scheme, _, value = header.partition(" ")
+        if scheme.lower() == "basic":
+            decoded = base64.b64decode(value).decode("utf-8")
+            _, _, supplied = decoded.partition(":")
+            return supplied
+        if scheme.lower() == "bearer":
+            return value
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return None
 
 
 def _first(query: dict, key: str) -> str:

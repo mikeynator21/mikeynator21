@@ -59,7 +59,13 @@ the phone, and they cover for each other.
 git clone https://github.com/mikeynator21/wifiguard
 cd wifiguard
 sudo ./install.sh
+sudo wifiguard setup
 ```
+
+`setup` asks four questions — what you want protected, how much filtering, what
+devices you own, whether you want the VPN — then writes a correct configuration
+and prints exactly what to do next. It will not produce a configuration that
+exposes the dashboard without a password, and it hashes the one you choose.
 
 Nothing is compiled and nothing is fetched, so you can also just run it out of
 the clone without installing at all:
@@ -154,6 +160,46 @@ Watch it on the dashboard, or:
 ```bash
 wifiguard status
 ```
+
+## Hardening
+
+Three things are refused rather than warned about, because each is a way to
+lose the network to whoever is standing on it:
+
+- **An exposed dashboard with no password.** Reaching it means being able to
+  switch filtering off and add VPN peers, so binding it anywhere but localhost
+  requires a password. It is stored as an scrypt hash (`wifiguard passwd`), and
+  repeated failures lock the client out.
+- **Exception rules in downloaded blocklists.** An `@@||domain^` rule silently
+  un-filters a name. A hijacked list source could use one to un-block whatever
+  it liked, and nothing would look wrong — so allowlisting stays a local
+  decision.
+- **A blocklist that collapses.** A source that suddenly loses most of its
+  rules is broken or is not the source you think it is. The update is refused
+  and the previous copy kept.
+
+State-changing requests must be `application/json`, which a browser cannot send
+cross-origin without a preflight nothing here answers — so a page on your LAN
+cannot make a logged-in browser change your settings.
+
+To audit an existing install:
+
+```console
+$ wifiguard harden
+  [HIGH  ] server.allowed_networks accepts the whole internet.
+            This makes an open resolver, which will be found and abused.
+            List only your own private ranges.
+
+  [medium] Downloaded lists are trusted to write exception rules.
+            A hijacked list source could un-block anything.
+```
+
+It exits non-zero on anything high, so it works in a check script.
+
+**It is not impenetrable, and nothing is.** What it is: encrypted where it
+matters, hard to reach without credentials, hard to feed bad data, and honest
+about the two things DNS filtering cannot do — see
+[Known limits](#known-limits).
 
 ## Holding the line
 
@@ -293,7 +339,7 @@ Worked examples are in [deploy/examples/](deploy/examples/).
 Three layers, each proving something the one below it cannot.
 
 ```bash
-python3 -m unittest discover -s tests -v      # 309 unit tests, no network needed
+python3 -m unittest discover -s tests -v      # 357 unit tests, no network needed
 wifiguard selftest                            # 55 checks, the real stack on loopback
 sudo ./tests/integration/run.sh               # 66 checks on a virtual network
 ```
@@ -318,6 +364,18 @@ time, that a blocklist cannot take that away, and that multicast discovery
 crosses between two subnets only when reflection is switched on. See
 [tests/integration/README.md](tests/integration/README.md), including the two
 real bugs it caught that the unit tests could not.
+
+## Known limits
+
+Stated here rather than left to be discovered:
+
+- **Ads from the content's own domain** — YouTube pre-rolls, Facebook in-feed —
+  cannot be blocked by DNS without blocking the service. No DNS filter can do
+  this. Use a browser content blocker as well.
+- **An app with its own resolver** to an address not on the block list will get
+  around the filter. The firewall rules narrow this a lot; they do not close it.
+- **hostapd is not covered by the tests** — an access point needs a real radio.
+- **Android without root** cannot bind port 53 or install firewall rules.
 
 ## Requirements
 

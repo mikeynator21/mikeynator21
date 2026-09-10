@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Getting started:\n"
-            "  wifiguard init-config > /etc/wifiguard/wifiguard.toml\n"
+            "  sudo wifiguard setup        # answer a few questions, get a config\n"
             "  wifiguard doctor            # check this machine is ready\n"
             "  wifiguard fieldtest         # what is this network doing to my DNS?\n"
             "  sudo wifiguard run          # start filtering\n"
@@ -70,6 +70,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="show the running service's status")
     sub.add_parser("doctor", help="check this machine can run the gateway")
     sub.add_parser("init-config", help="print a commented example configuration")
+
+    setup = sub.add_parser(
+        "setup", help="answer a few questions and get a working configuration"
+    )
+    setup.add_argument("--out", default="", help="where to write it")
+    setup.add_argument("--force", action="store_true", help="replace an existing config")
+
+    passwd = sub.add_parser("passwd", help="hash a dashboard password for the config")
+    passwd.add_argument(
+        "--stdin", action="store_true", help="read the password from stdin instead of prompting"
+    )
+
+    sub.add_parser("harden", help="audit this configuration for weak settings")
 
     fieldtest = sub.add_parser(
         "fieldtest",
@@ -835,6 +848,163 @@ def command_tls(args: argparse.Namespace, cfg: Config) -> int:
     return 0
 
 
+def command_setup(args: argparse.Namespace, cfg: Config) -> int:
+    from . import setupwizard
+
+    target = Path(args.out) if args.out else setupwizard.DEFAULT_CONFIG_PATH
+    return setupwizard.run(target, force=args.force)
+
+
+def command_passwd(args: argparse.Namespace, cfg: Config) -> int:
+    """Turn a password into something safe to keep in a config file."""
+    from .auth import hash_password
+
+    if args.stdin:
+        password = sys.stdin.readline().rstrip("\n")
+    else:
+        import getpass
+
+        password = getpass.getpass("  password: ")
+        if password and getpass.getpass("  again: ") != password:
+            print("Those did not match.", file=sys.stderr)
+            return 1
+
+    if not password:
+        print("No password given.", file=sys.stderr)
+        return 1
+    if len(password) < 8:
+        print("Use at least 8 characters.", file=sys.stderr)
+        return 1
+
+    print()
+    print("Put this in wifiguard.toml:")
+    print()
+    print("  [dashboard]")
+    print(f'  password = "{hash_password(password)}"')
+    print()
+    print("The password itself is not recoverable from that, so the config file")
+    print("no longer carries a usable secret.")
+    return 0
+
+
+def command_harden(args: argparse.Namespace, cfg: Config) -> int:
+    """Report settings that weaken this install, and how to fix each."""
+    from .auth import is_hashed, looks_local
+
+    findings: list[tuple[str, str, str]] = []
+
+    def note(severity: str, what: str, fix: str) -> None:
+        findings.append((severity, what, fix))
+
+    # -- exposure ---------------------------------------------------------
+    if cfg.dashboard.enabled and not looks_local(cfg.dashboard.address):
+        if not cfg.dashboard.password:
+            note("high", "The dashboard is on the network with no password.",
+                 "Set one: wifiguard passwd")
+        elif not is_hashed(cfg.dashboard.password):
+            note("medium", "The dashboard password is stored in the clear.",
+                 "Replace it with a hash: wifiguard passwd")
+    if cfg.dashboard.enabled and cfg.dashboard.allow_insecure:
+        note("high", "dashboard.allow_insecure is on, which waives the password check.",
+             "Remove it and set a password instead.")
+
+    # -- the resolver -----------------------------------------------------
+    if "0.0.0.0/0" in cfg.server.allowed_networks or "::/0" in cfg.server.allowed_networks:
+        note("high", "server.allowed_networks accepts the whole internet.",
+             "This makes an open resolver, which will be found and abused. "
+             "List only your own private ranges.")
+    if cfg.server.rate_limit <= 0:
+        note("medium", "Per-client rate limiting is off.",
+             "Set server.rate_limit to something like 100.")
+
+    # -- upstream ---------------------------------------------------------
+    if not cfg.upstream.require_encrypted:
+        note("high", "Plaintext DNS upstreams are permitted.",
+             "Set upstream.require_encrypted = true and use https:// or tls:// servers.")
+    plaintext = [s for s in cfg.upstream.servers if not s.startswith(("https://", "tls://"))]
+    if plaintext:
+        note("high", f"These upstreams are unencrypted: {', '.join(plaintext)}",
+             "Everyone on the path to them sees every lookup this network makes.")
+    if not cfg.upstream.pins:
+        note("low", "No resolver public keys are pinned.",
+             "Certificate verification alone cannot see through an interception "
+             "whose CA your machine trusts. Capture pins on a network you trust: "
+             "wifiguard tls pin dns.quad9.net")
+    if cfg.upstream.tls_profile == "compatible":
+        note("low", "TLS profile is 'compatible', which allows TLS 1.2.",
+             "Use 'strict', or 'paranoid' to require TLS 1.3.")
+
+    # -- filtering integrity ----------------------------------------------
+    if cfg.blocklists.trust_remote_allow_rules:
+        note("medium", "Downloaded lists are trusted to write exception rules.",
+             "A hijacked list source could un-block anything. Turn "
+             "blocklists.trust_remote_allow_rules off.")
+    if cfg.blocklists.collapse_threshold <= 0:
+        note("low", "A blocklist that collapses to nothing will be accepted.",
+             "Set blocklists.collapse_threshold to 0.5.")
+    if not cfg.blocklists.block_doh_bypass:
+        note("medium", "Public DoH bootstrap names are not blocked.",
+             "Browsers will resolve around the filter. Set "
+             "blocklists.block_doh_bypass = true.")
+
+    # -- the filter itself -------------------------------------------------
+    if not cfg.engine.rebinding_protection:
+        note("medium", "DNS rebinding protection is off.",
+             "Set engine.rebinding_protection = true.")
+    if not cfg.engine.refuse_any:
+        note("low", "ANY queries are answered.",
+             "That is a DNS amplification vector. Set engine.refuse_any = true.")
+    if not cfg.compatibility.protect_essentials:
+        note("medium", "Essential services are not protected.",
+             "A blocklist can take away a device's clock or certificate checks, "
+             "which breaks it with no clue why.")
+
+    # -- gateway -----------------------------------------------------------
+    if cfg.hotspot.enabled:
+        if not cfg.hotspot.isolate_from_uplink:
+            note("medium", "Clients are not isolated from the network you join.",
+                 "On a hotel or cafe LAN that is a segment full of strangers' "
+                 "machines. Set hotspot.isolate_from_uplink = true.")
+        if cfg.hotspot.allow_ipv6:
+            note("medium", "Client IPv6 is forwarded unfiltered.",
+                 "That is a path around IPv4 filtering. Leave hotspot.allow_ipv6 off "
+                 "unless you have a filtered v6 path.")
+        if len(cfg.hotspot.passphrase) < 12:
+            note("low", "The hotspot passphrase is short.",
+                 "WPA3 makes offline cracking hard, but WPA2 clients fall back. "
+                 "Twelve characters or more.")
+
+    # -- privacy -----------------------------------------------------------
+    if cfg.logging.log_queries and cfg.logging.retention_days > 30:
+        note("low", f"Query logs are kept for {cfg.logging.retention_days} days.",
+             "That is a detailed record of what your household reads. Shorten it, "
+             "or set logging.log_queries = false.")
+
+    # -- report -------------------------------------------------------------
+    if not findings:
+        print("Nothing to flag. This configuration is about as tight as it goes")
+        print("without making it harder to live with.")
+        print()
+        print("Worth remembering anyway: DNS filtering cannot block ads served from")
+        print("the same domain as the content, and a device that ships its own")
+        print("resolver to an address not on the block list will get around it.")
+        return 0
+
+    order = {"high": 0, "medium": 1, "low": 2}
+    findings.sort(key=lambda item: order[item[0]])
+    labels = {"high": "HIGH  ", "medium": "medium", "low": "low   "}
+
+    print(f"{len(findings)} thing(s) worth changing:\n")
+    for severity, what, fix in findings:
+        print(f"  [{labels[severity]}] {what}")
+        for line in _wrap(fix, 68):
+            print(f"            {line}")
+        print()
+
+    high = sum(1 for severity, _, _ in findings if severity == "high")
+    return 1 if high else 0
+
+
 def command_init_config(args: argparse.Namespace, cfg: Config) -> int:
     print(config_module.EXAMPLE_CONFIG, end="")
     return 0
@@ -941,6 +1111,9 @@ COMMANDS = {
     "compat": command_compat,
     "tls": command_tls,
     "init-config": command_init_config,
+    "setup": command_setup,
+    "passwd": command_passwd,
+    "harden": command_harden,
 }
 
 

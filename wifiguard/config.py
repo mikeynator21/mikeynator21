@@ -122,6 +122,15 @@ class BlocklistSettings:
     block_doh_bypass: bool = True
     #: A bare domain in a hosts-format list also blocks everything beneath it.
     hosts_match_subdomains: bool = True
+    #: Honour @@|| exception rules found in downloaded lists. Off by default:
+    #: an exception rule silently switches protection off for a name, so a
+    #: hijacked list source could un-block whatever it liked. Allowlisting
+    #: stays a local decision.
+    trust_remote_allow_rules: bool = False
+    #: Refuse an update that drops a source below this fraction of its previous
+    #: rule count. A list that suddenly loses most of its rules is broken or
+    #: hijacked; the previous copy is better than the new one. 0 disables.
+    collapse_threshold: float = 0.5
     #: Refresh interval in hours. Refreshes are conditional requests, so a
     #: frequent schedule is cheap; the default is still weekly.
     refresh_hours: int = 168
@@ -177,10 +186,16 @@ class DashboardSettings:
     enabled: bool = True
     address: str = "127.0.0.1"
     port: int = 8080
-    #: Setting this requires a password for any change; reads stay open on the
-    #: local network. Empty disables authentication entirely.
+    #: Required before the dashboard may be reached from anywhere but this
+    #: machine. Store a hash rather than the password itself -- generate one
+    #: with `wifiguard passwd`. A plaintext value still works and is warned
+    #: about.
     password: str = ""
     readonly: bool = False
+    #: Bind to the network with no password anyway. Reaching the dashboard
+    #: means being able to switch filtering off and add VPN peers, so this is
+    #: a deliberate decision rather than a default.
+    allow_insecure: bool = False
 
 
 @dataclass
@@ -380,6 +395,23 @@ def _populate(target: Any, values: dict[str, Any], section: str) -> None:
 def _validate(config: Config) -> None:
     if not 1 <= config.server.port <= 65_535:
         raise ConfigError(f"server.port must be 1-65535, got {config.server.port}")
+    from .auth import looks_local
+
+    if (
+        config.dashboard.enabled
+        and not looks_local(config.dashboard.address)
+        and not config.dashboard.password
+        and not config.dashboard.allow_insecure
+    ):
+        raise ConfigError(
+            f"dashboard.address is {config.dashboard.address!r}, which exposes the "
+            f"dashboard to the network, but no dashboard.password is set. Anyone "
+            f"who can reach it could switch filtering off or add a VPN peer.\n"
+            f"  Set a password:  wifiguard passwd\n"
+            f"  Or keep it local: dashboard.address = \"127.0.0.1\"\n"
+            f"  Or accept the risk deliberately: dashboard.allow_insecure = true"
+        )
+
     if not 1 <= config.dashboard.port <= 65_535:
         raise ConfigError(f"dashboard.port must be 1-65535, got {config.dashboard.port}")
     if config.server.port == config.dashboard.port:
@@ -389,6 +421,12 @@ def _validate(config: Config) -> None:
         raise ConfigError(
             f"engine.block_mode must be zero, nxdomain or refused, got {config.engine.block_mode!r}"
         )
+    if not 0.0 <= config.blocklists.collapse_threshold < 1.0:
+        raise ConfigError(
+            f"blocklists.collapse_threshold must be between 0 and 1 (0 disables the "
+            f"check), got {config.blocklists.collapse_threshold}"
+        )
+
     if config.upstream.tls_profile not in ("compatible", "strict", "paranoid"):
         raise ConfigError(
             f"upstream.tls_profile must be compatible, strict or paranoid, "

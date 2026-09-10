@@ -43,6 +43,8 @@ class Application:
         self.blocklists = BlocklistManager(
             config.blocklist_cache_dir,
             hosts_match_subdomains=config.blocklists.hosts_match_subdomains,
+            trust_remote_allow_rules=config.blocklists.trust_remote_allow_rules,
+            collapse_threshold=config.blocklists.collapse_threshold,
         )
         # A subnet-to-group mapping is just a device rule whose identifier is a
         # CIDR range, so it goes through the same matcher.

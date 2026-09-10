@@ -27,7 +27,15 @@ max_entries = 200000
 
 [dashboard]
 enabled = true
-address = "0.0.0.0"
+# Localhost only. A shipped default password is one nobody changes, and this
+# dashboard can switch filtering off and add VPN peers -- so it stays off the
+# network until you decide otherwise.
+#
+# To reach it from another machine, either tunnel in:
+#     ssh -L 8080:127.0.0.1:8080 you@this-host
+# or expose it properly, with a password of your own:
+#     wifiguard passwd            # prints a hash to paste below
+#     address = "0.0.0.0"
+#     password = "scrypt$..."
+address = "127.0.0.1"
 port = 8080
-# Reachable from the LAN, so it needs a password.
-password = "change-me"

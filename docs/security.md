@@ -139,6 +139,54 @@ defaults (Quad9, Cloudflare) are chosen for stated no-log policies and
 malware filtering at the resolver, which is not the same as being able to
 verify them.
 
+## Reaching the dashboard
+
+The dashboard can add VPN peers and switch filtering off, so reaching it is
+close to owning the network it protects. Accordingly:
+
+- Binding it anywhere but localhost **requires a password**. This is refused at
+  configuration load, not warned about, and waiving it takes an explicit
+  `dashboard.allow_insecure = true`.
+- The password is stored as an **scrypt hash** (n=16384, r=8) — memory-hard, so
+  a stolen config cannot be attacked at GPU speed. `wifiguard passwd` generates
+  one. A plaintext value still works so upgrades do not break, and is warned
+  about at start-up.
+- Five failures in five minutes **locks that client out** for five minutes.
+  scrypt already makes each guess expensive; this stops a client tying up the
+  server making them.
+- Writes must be `application/json`. A browser cannot send that content type
+  cross-origin without a CORS preflight that nothing here answers, so a page on
+  your LAN cannot make a logged-in browser change your settings.
+
+## Trusting the blocklists
+
+Downloading rules from someone else is a supply chain, and it is treated as one.
+
+**Exception rules from downloads are ignored.** An `@@||domain^` rule switches
+protection off for a name. Honouring one from a source that could be hijacked
+would let it un-block whatever it liked with nothing looking wrong.
+Allowlisting is a local decision; `blocklists.trust_remote_allow_rules` turns
+this off if you need it.
+
+**A collapsed source is refused.** If a list that had 80,000 rules comes back
+with 12, that is a broken source or a hijacked one. The update is rejected and
+the previous copy kept. Local files are exempt — a file shrinking is its owner
+editing it.
+
+Neither replaces reading what you subscribe to. They bound the damage from a
+source that goes bad after you did.
+
+## Auditing an install
+
+```bash
+wifiguard harden
+```
+
+Reports weak settings by severity with the fix for each, and exits non-zero on
+anything high so it can go in a check script. It covers exposure, open-resolver
+risk, plaintext upstreams, missing pins, blocklist trust, rebinding,
+amplification, gateway isolation and log retention.
+
 ## Handling of secrets
 
 - `peers.json` holds WireGuard private keys. Mode 0600, and written atomically.

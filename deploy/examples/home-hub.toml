@@ -58,9 +58,12 @@ listen_port = 51820
 
 [dashboard]
 enabled = true
+# Exposing this to the LAN requires a password -- WiFiGuard refuses to start
+# otherwise, because reaching the dashboard means being able to switch
+# filtering off. Generate the hash with `wifiguard passwd`.
 address = "0.0.0.0"
 port = 8080
-password = "change-me"
+password = "scrypt$REPLACE$ME"    # wifiguard passwd
 
 [logging]
 log_queries = true
